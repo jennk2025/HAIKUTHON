@@ -75,7 +75,7 @@ def ranks_of(items, stage, k=0, lam=0.0, tau=None):
     return out
 
 
-def run_combo(rows, dev_ids, val_ids, siglip_img_fn, siglip_txt_fn, itm, lam_cond, K=10, k_list=(2, 3, 5),
+def run_combo(rows, dev_ids, val_ids, siglip_img_fn, siglip_txt_fn, itm, lam_cond, K=10, k_list=(3, 5, 7),
               lam_grid=(0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 1.0), tau_q=(0.2, 0.4, 0.6, 0.8, 1.01)):
     by_id = {r["id"]: r for r in rows}
     ids = list(dev_ids) + list(val_ids)
@@ -156,6 +156,7 @@ def main():
     ap.add_argument("--siglip", default=SIGLIP_ID)
     ap.add_argument("--lam-cond", type=float, default=3.2)
     ap.add_argument("--train-itm", action="store_true", help="ITM 학습 분할로 BLIP을 학습해 함께 평가 ([3/3]과 같은 분할)")
+    ap.add_argument("--skip-base", action="store_true", help="학습 전 BLIP 조합 평가는 건너뜀")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dev-frac", type=float, default=0.15)
@@ -175,8 +176,9 @@ def main():
     img_fn, txt_fn = _siglip(args.siglip, device)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     res = {"lam_cond": args.lam_cond}
-    res["blip_base"] = run_combo(rows, dev, va, img_fn, txt_fn, BlipITM(BLIP_ID, device), args.lam_cond)
-    print("BLIP(학습 전) 조합:", json.dumps(res["blip_base"]["val"], ensure_ascii=False), flush=True)
+    if not args.skip_base:
+        res["blip_base"] = run_combo(rows, dev, va, img_fn, txt_fn, BlipITM(BLIP_ID, device), args.lam_cond)
+        print("BLIP(학습 전) 조합:", json.dumps(res["blip_base"]["val"], ensure_ascii=False), flush=True)
     if args.train_itm:
         from haiku.itm_finetune import train_itm, wrap
         ns = argparse.Namespace(blip=BLIP_ID, seed=args.seed, lr=2e-5, epochs=args.epochs, queries_per_step=8, negatives=7)

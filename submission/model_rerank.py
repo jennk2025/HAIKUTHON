@@ -1,12 +1,13 @@
-"""HAIKUTHON 제출 모델: SigLIP 검색 + 조건 분해 재정렬.
+"""HAIKUTHON 제출 모델: SigLIP 검색 → 조건 분해 재정렬 → (선택) BLIP ITM 재정렬.
 
-1. 후보 이미지를 SigLIP으로 한 번 인코딩한다 (DataLoader worker로 디코딩 병렬화).
+1. 후보 이미지를 한 번 읽어 SigLIP으로 인코딩한다 (DataLoader worker로 디코딩 병렬화).
+   BLIP을 쓰면 같은 크기로 줄인 이미지를 GPU에 보관해 BLIP도 다시 읽지 않고 쓴다.
 2. 질의마다 원문으로 상위 K개 후보를 찾는다.
-3. 질의 문장 하나에서 규칙으로 객체별 조건(색·개수·상태·결합·관계)과 대조 문구를 만들고,
-   후보 K개에 대한 조건 점수를 원래 점수에 더해 순위를 조정한다 (후보를 탈락시키지 않음).
+3. 질의 문장 하나에서 규칙으로 객체별 조건과 대조 문구를 만들고, 후보 K개의 조건 점수를 원래 점수에 더한다.
+4. (models/blip이 있고 설정에서 켰을 때) 조건 재정렬 결과의 상위 k개를 BLIP ITM(교차 어텐션)으로 다시 채점해 더한다.
 - 각 질의의 순위는 그 질의 문장과 후보 이미지만으로 계산한다. 다른 질의의 결과로 보정하지 않는다.
 - 같은 문구의 임베딩은 재사용한다 (값이 문구만으로 정해지므로 다른 질의에 의존하지 않음).
-- 재정렬을 할지는 이미지 인코딩 직후 한 번만 정해 모든 질의에 똑같이 적용한다 (시간 안전장치).
+- 재정렬·BLIP 사용 여부는 이미지 인코딩 직후 한 번만 정해 모든 질의에 똑같이 적용한다 (시간 안전장치).
 - models/ 폴더의 가중치와 설정만 읽는다. 네트워크를 쓰지 않는다.
 """
 import os
@@ -23,14 +24,16 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch.nn.functional import normalize
 from transformers import AutoModel, AutoProcessor
 
 from haiku.rerank import PhraseBank, all_phrases, condition_margins, extract_conditions, rerank_scores
 
-IMG_BATCH, TXT_BATCH, MAX_TEXT_LEN = 64, 256, 64
+IMG_BATCH, TXT_BATCH, MAX_TEXT_LEN, BLIP_BATCH, ITM_QBATCH = 64, 256, 64, 64, 128
 WORKERS = int(os.environ.get("HAIKU_WORKERS", min(4, os.cpu_count() or 1)))
 
 
@@ -41,7 +44,25 @@ def load_model(model_dir, device):
     net = AutoModel.from_pretrained(root / "siglip", local_files_only=True, dtype=dtype).to(device).eval()
     proc = AutoProcessor.from_pretrained(root / "siglip", local_files_only=True)
     cfg = json.loads((root / "haiku_config.json").read_text(encoding="utf-8"))
-    return {"net": net, "proc": proc, "device": device, "cfg": cfg}
+    model = {"net": net, "proc": proc, "device": device, "cfg": cfg, "blip": None}
+    if (cfg.get("itm") or {}).get("use") and (root / "blip").exists():
+        from transformers import BlipForImageTextRetrieval
+        blip = BlipForImageTextRetrieval.from_pretrained(root / "blip", local_files_only=True, dtype=dtype).to(device).eval()
+        model["blip"] = blip
+        model["blip_proc"] = AutoProcessor.from_pretrained(root / "blip", local_files_only=True)
+    return model
+
+
+def _size(ip):
+    """전처리 설정의 입력 크기 (dict / SizeDict / 숫자 모두 처리)."""
+    s = ip.size
+    for key in ("height", "shortest_edge"):
+        v = getattr(s, key, None)
+        if v is None and isinstance(s, dict):
+            v = s.get(key)
+        if v:
+            return int(v)
+    return int(s) if isinstance(s, (int, float)) else 384
 
 
 class _Images(torch.utils.data.Dataset):
@@ -57,8 +78,32 @@ class _Images(torch.utils.data.Dataset):
         return self.ip(images=im, return_tensors="pt")["pixel_values"][0]
 
 
+class _Raw(torch.utils.data.Dataset):
+    """같은 크기로 줄인 uint8 이미지 (SigLIP·BLIP이 함께 씀)."""
+
+    def __init__(self, paths, size):
+        self.paths, self.size = paths, size
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, i):
+        with Image.open(self.paths[i]) as im:
+            im = im.convert("RGB").resize((self.size, self.size), Image.BICUBIC)
+        return torch.from_numpy(np.asarray(im).copy()).permute(2, 0, 1)
+
+
 def _feats(out):
     return out.pooler_output if hasattr(out, "pooler_output") else out
+
+
+def _norm(x_uint8, ip, size, dtype):
+    x = x_uint8.float() / 255.0
+    if x.shape[-1] != size:
+        x = F.interpolate(x, size=(size, size), mode="bicubic", antialias=True, align_corners=False).clamp(0, 1)
+    mean = torch.tensor(ip.image_mean, device=x.device).view(1, 3, 1, 1)
+    std = torch.tensor(ip.image_std, device=x.device).view(1, 3, 1, 1)
+    return ((x - mean) / std).to(dtype)
 
 
 @torch.inference_mode()
@@ -68,6 +113,24 @@ def encode_images(model, paths):
                                      num_workers=WORKERS, pin_memory=dev.type == "cuda")
     return torch.cat([normalize(_feats(net.get_image_features(
         pixel_values=px.to(dev, dtype=net.dtype, non_blocking=True))).float(), dim=-1) for px in dl])
+
+
+@torch.inference_mode()
+def encode_images_raw(model, paths):
+    """이미지를 한 번만 읽어 SigLIP 임베딩과 BLIP용 uint8 보관본을 함께 만든다."""
+    net, dev = model["net"], model["device"]
+    sip, bip = model["proc"].image_processor, model["blip_proc"].image_processor
+    s_size, b_size = _size(sip), _size(bip)
+    dl = torch.utils.data.DataLoader(_Raw(paths, b_size), batch_size=IMG_BATCH, num_workers=WORKERS,
+                                     pin_memory=dev.type == "cuda")
+    raw = torch.empty((len(paths), 3, b_size, b_size), dtype=torch.uint8, device=dev)
+    vecs, s = [], 0
+    for x in dl:
+        x = x.to(dev, non_blocking=True)
+        raw[s:s + len(x)] = x
+        s += len(x)
+        vecs.append(normalize(_feats(net.get_image_features(pixel_values=_norm(x, sip, s_size, net.dtype))).float(), dim=-1))
+    return torch.cat(vecs), raw
 
 
 @torch.inference_mode()
@@ -82,18 +145,51 @@ def encode_texts(model, prompts):
 
 
 @torch.inference_mode()
+def itm_scores(model, raw, img_idx, texts):
+    """(문장, 이미지) 쌍마다 BLIP 매칭 로짓 차이. 이미지 특징은 이번 묶음에 필요한 것만 계산."""
+    blip, bproc, dev = model["blip"], model["blip_proc"], model["device"]
+    bip = bproc.image_processor
+    uniq = sorted(set(img_idx))
+    where = {j: n for n, j in enumerate(uniq)}
+    feats = []
+    for s in range(0, len(uniq), BLIP_BATCH):
+        px = _norm(raw[uniq[s:s + BLIP_BATCH]], bip, _size(bip), next(blip.parameters()).dtype)
+        feats.append(blip.vision_model(pixel_values=px).last_hidden_state)
+    feats = torch.cat(feats)
+    out = []
+    for s in range(0, len(texts), BLIP_BATCH):
+        tok = bproc.tokenizer(texts[s:s + BLIP_BATCH], padding=True, truncation=True, max_length=72,
+                              return_tensors="pt").to(dev)
+        img = feats[[where[j] for j in img_idx[s:s + BLIP_BATCH]]]
+        att = torch.ones(img.shape[:-1], dtype=torch.long, device=dev)
+        h = blip.text_encoder(input_ids=tok["input_ids"], attention_mask=tok["attention_mask"],
+                              encoder_hidden_states=img, encoder_attention_mask=att).last_hidden_state
+        logit = blip.itm_head(h[:, 0, :]).float()
+        out.append(logit[:, 1] - logit[:, 0])
+    return torch.cat(out)
+
+
+@torch.inference_mode()
 def predict(model, queries, candidates, top_k=5):
     t0 = time.perf_counter()
     cfg = model["cfg"]
     K, method, lam = int(cfg.get("K", 10)), cfg.get("method", "B"), float(cfg.get("lam", 0.0))
     reliability, tau = cfg.get("reliability", {}), cfg.get("tau")
     kinds = set(cfg["kinds"]) if cfg.get("kinds") else None          # 쓸 조건 종류 (없으면 전부)
+    icfg = cfg.get("itm") or {}
     image_ids = [c["image_id"] for c in candidates]
-    image_vecs = encode_images(model, [c["image_path"] for c in candidates])
-    # 재정렬 여부는 여기서 한 번만 정한다 (질의 내용과 무관, 모든 질의에 동일)
-    use_rerank = method != "A" and lam > 0 and (time.perf_counter() - t0) < float(cfg.get("skip_rerank_after_sec", 700))
+    paths = [c["image_path"] for c in candidates]
+    if model.get("blip") is not None:
+        image_vecs, raw = encode_images_raw(model, paths)
+    else:
+        image_vecs, raw = encode_images(model, paths), None
+    # 재정렬·BLIP 사용 여부는 여기서 한 번만 정한다 (질의 내용과 무관, 모든 질의에 동일)
+    elapsed = time.perf_counter() - t0
+    use_rerank = method != "A" and lam > 0 and elapsed < float(cfg.get("skip_rerank_after_sec", 700))
+    use_itm = raw is not None and icfg.get("use") and elapsed < float(icfg.get("skip_after_sec", 600))
+    k_itm, lam_itm, tau_itm = int(icfg.get("k", 2)), float(icfg.get("lam", 0.0)), icfg.get("tau")
     bank = PhraseBank(lambda t: encode_texts(model, t))
-    predictions = {}
+    orders, heads = [], []
     for s in range(0, len(queries), TXT_BATCH):
         batch = queries[s:s + TXT_BATCH]
         text_vecs = encode_texts(model, [q["prompt"] for q in batch])
@@ -102,13 +198,27 @@ def predict(model, queries, candidates, top_k=5):
                  for q in batch] if use_rerank else None
         if use_rerank:
             bank.add([p for c in conds for p in all_phrases(c)])
-        for i, q in enumerate(batch):
+        for i in range(len(batch)):
             idx, s_k = top.indices[i], top.values[i]
+            new = s_k[:K]
             if use_rerank and conds[i]:
                 M = condition_margins(conds[i], bank, image_vecs[idx[:K]])
                 new = rerank_scores(s_k[:K], conds[i], M, method, lam, reliability, tau)
-                order = torch.cat([idx[:K][new.argsort(descending=True)], idx[K:]])
-            else:
-                order = idx
-            predictions[q["prompt_id"]] = [image_ids[j] for j in order[:top_k].tolist()]
-    return predictions
+            o = new.argsort(descending=True)
+            orders.append(torch.cat([idx[:K][o], idx[K:]]).tolist())
+            heads.append(new[o].float())
+    if use_itm and lam_itm > 0:
+        k_itm = min(k_itm, K)
+        sel = [n for n in range(len(queries)) if tau_itm is None or float(heads[n][0] - heads[n][1]) < tau_itm]
+        # 같은 후보를 보는 질의끼리 묶어 BLIP 이미지 특징 재계산을 줄인다 (각 질의의 결과는 묶음과 무관)
+        sel.sort(key=lambda n: orders[n][0])
+        for s in range(0, len(sel), ITM_QBATCH):
+            chunk = sel[s:s + ITM_QBATCH]
+            texts = [queries[n]["prompt"] for n in chunk for _ in range(k_itm)]
+            img_idx = [orders[n][j] for n in chunk for j in range(k_itm)]
+            sc = itm_scores(model, raw, img_idx, texts).view(len(chunk), k_itm)
+            for r, n in enumerate(chunk):
+                h = heads[n][:k_itm].to(sc) + lam_itm * sc[r]
+                head = [orders[n][j] for j in h.argsort(descending=True).tolist()]
+                orders[n] = head + orders[n][k_itm:]
+    return {q["prompt_id"]: [image_ids[j] for j in orders[n][:top_k]] for n, q in enumerate(queries)}
