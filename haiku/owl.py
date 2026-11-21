@@ -19,13 +19,17 @@ from haiku.siblings import parse_prompt
 OWL_ID = "google/owlvit-base-patch32"
 
 
-def spatial_relations(prompt):
-    """질의 하나 → [(rel, x, y)] (rel ∈ left_of, above). 대상이 모호한 관계는 제외."""
+BASE_RELS = ("left_of", "above")
+EXT_RELS = ("left_of", "above", "on", "inside", "rides", "next_to")       # 상자 규칙으로 확인할 수 있는 관계
+
+
+def spatial_relations(prompt, kinds=BASE_RELS):
+    """질의 하나 → [(rel, x, y)] (rel ∈ kinds). 대상이 모호한 관계는 제외."""
     p = parse_prompt(prompt)
     multi = {f.split(":", 1)[1] for f in p["flags"] if f.startswith("multi_instance:")}
     one = {n for n, o in p["objects"].items() if o["count"] == 1}              # 물체가 여러 개면 어느 것인지 애매하므로 제외
     return [(r, x, y) for r, x, y in p["relations"]
-            if r in ("left_of", "above") and x not in multi and y not in multi and x in one and y in one]
+            if r in kinds and x not in multi and y not in multi and x in one and y in one]
 
 
 class OwlChecker:
@@ -69,20 +73,43 @@ class OwlChecker:
         return {it: self.cache[it] for it in items}
 
 
+def _rel_value(rel, a, b, margin):
+    """상자 a(주체 x), b(대상 y) = (score, cx, cy, w, h) → +1(맞음) / -1(어김) / 0(판단 보류)."""
+    if rel in ("left_of", "above"):
+        d = (b[1] - a[1]) if rel == "left_of" else (b[2] - a[2])           # x가 y의 왼쪽/위면 양수
+        return 1 if d > margin else (-1 if d < -margin else 0)
+    if len(a) < 5 or len(b) < 5:
+        return 0
+    ax0, ax1, ay0, ay1 = a[1] - a[3] / 2, a[1] + a[3] / 2, a[2] - a[4] / 2, a[2] + a[4] / 2
+    bx0, bx1, by0, by1 = b[1] - b[3] / 2, b[1] + b[3] / 2, b[2] - b[4] / 2, b[2] + b[4] / 2
+    ix, iy = max(0.0, min(ax1, bx1) - max(ax0, bx0)), max(0.0, min(ay1, by1) - max(ay0, by0))
+    a_in_b = ix * iy / max(a[3] * a[4], 1e-6)                             # x 상자 중 y 상자 안에 든 비율
+    if rel == "inside":
+        return 1 if a_in_b >= 0.7 else (-1 if a_in_b <= 0.2 else 0)
+    if rel in ("on", "rides"):                                            # 위쪽에 있고 좌우로 겹침
+        d = b[2] - a[2]
+        if d > margin and ix > 0:
+            return 1
+        return -1 if d < -margin else 0
+    if rel == "next_to":                                                  # 나란히, 겹치지 않음
+        dx, dy = abs(b[1] - a[1]), abs(b[2] - a[2])
+        small = min(a[3] * a[4], b[3] * b[4])
+        overlap = ix * iy / max(small, 1e-6)
+        if overlap < 0.2 and dx > dy + margin:
+            return 1
+        return -1 if (overlap > 0.6 or dy > dx + margin) else 0
+    return 0
+
+
 def relation_score(det, rels, thr, margin):
     """관계마다 +1(맞음) / -1(어김) / 0(판단 보류)의 합."""
     total = 0
     for rel, x, y in rels:
         if x not in det or y not in det:
             continue
-        (sx, xx, xy), (sy, yx, yy) = det[x][:3], det[y][:3]
-        if min(sx, sy) < thr:
+        if min(det[x][0], det[y][0]) < thr:
             continue
-        d = (yx - xx) if rel == "left_of" else (yy - xy)                 # x가 y의 왼쪽/위면 양수
-        if d > margin:
-            total += 1
-        elif d < -margin:
-            total -= 1
+        total += _rel_value(rel, det[x], det[y], margin)
     return total
 
 

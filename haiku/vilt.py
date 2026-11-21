@@ -327,10 +327,10 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
     if owl_chk is not None:
         from haiku.owl import relation_score, spatial_relations
 
-        def owl_prep(items, g_ids, orders):
+        def owl_prep(items, g_ids, orders, kinds=("left_of", "above")):
             out, need = [], []
             for it, (o, _) in zip(items, orders):
-                rels = spatial_relations(prompts[it["q"]])
+                rels = spatial_relations(prompts[it["q"]], kinds)
                 if rels and len(o) >= 2:
                     names = tuple(sorted({x for _, a, b in rels for x in (a, b)}))
                     paths = [by_id[g_ids[j]]["image_path"] for j in o[:2]]
@@ -362,6 +362,16 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
         res["val_relation_queries"] = sum(p is not None for p in v_p)
         res["owl_relation_images"] = owl_chk.n_forward - n_owl0
         res["owl_sec_per_image"] = round((owl_chk.sec - t_owl0) / max(owl_chk.n_forward - n_owl0, 1), 4)
+        # 확장: 위에 놓임·안·타고 있음·옆까지 상자 규칙으로 확인 (기준값은 개발에서 따로 정함)
+        from haiku.owl import EXT_RELS
+        n_ext0 = owl_chk.n_forward
+        d_px, v_px = owl_prep(dev_items, dev, d_o, EXT_RELS), owl_prep(val_items, va, v_o, EXT_RELS)
+        ogx = {(tt, mm): score(owl_ranks(dev_items, d_o, d_px, tt, mm)) for tt in thr_grid for mm in margin_grid}
+        tx, mx = max(ogx, key=ogx.get)
+        res["val_v3+OWL확장"] = met(owl_ranks(val_items, v_o, v_px, tx, mx), "v3+OWL확장")
+        chosen.update({"owl_ext_thr": tx, "owl_ext_margin": mx, "dev_v3+OWL확장": round(ogx[(tx, mx)], 4)})
+        res["val_relation_queries_ext"] = sum(p is not None for p in v_px)
+        res["owl_ext_new_images"] = owl_chk.n_forward - n_ext0
     if color_chk is not None:
         from haiku.colorcrop import pair_scores
 

@@ -72,3 +72,19 @@ def report(rows, per_query, variant="v3+OWL(v4값 0.1/0.06)", base_variant="v3")
     L.append(_line("both", [i for i in allidx if F[i]["both"]], ranks, base))
     L.append(_line("one of", [i for i in allidx if F[i]["one_of"]], ranks, base))
     return "\n".join(L)
+
+
+def by_relation(rows, per_query, variants=("v3", "v3+OWL(v4값 0.1/0.06)", "v3+OWL확장")):
+    """관계 종류별로 변형들의 1위 정답률을 나란히 본다 (질의 수 포함)."""
+    by_id = {r["id"]: r for r in rows}
+    q = per_query["q"]
+    F = [features(by_id[i]["prompt"]) for i in q]
+    variants = [v for v in variants if v in per_query["ranks"]]
+    L = ["===== 관계 종류별 1위 정답률: " + " → ".join(variants) + " ====="]
+    for k, ko in REL_KO.items():
+        idx = [i for i in range(len(q)) if k in F[i]["rel_kinds"]]
+        if not idx:
+            continue
+        accs = [sum(per_query["ranks"][v][i] == 1 for i in idx) / len(idx) for v in variants]
+        L.append(f"  {ko:16s} 질의 {len(idx):4d}  " + " → ".join(f"{a:.3f}" for a in accs))
+    return "\n".join(L)
