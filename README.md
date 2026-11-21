@@ -265,7 +265,7 @@ predict(model, queries, candidates, top_k=5) -> dict
 | 결과물 | 내용 |
 |---|---|
 | [`reports/data_audit.md`](reports/data_audit.md) | 자동 점검 보고서 (ID 대응, 손상, 형식·크기, 완전 중복, 근접 중복 후보, 텍스트 유사도, 문제 목록) |
-| [`reports/manual_review.md`](reports/manual_review.md) | 근접 중복 후보 육안 확인 기록 |
+| [`reports/manual_review.md`](reports/manual_review.md) | 근접 중복 후보 이미지 확인 기록 (판정자: Claude) |
 | [`reports/split_report.md`](reports/split_report.md) | 분할 결과와 학습·검증에 걸친 유사 쌍 |
 | [`splits/split_seed42.json`](splits/split_seed42.json) | 학습 3,200 / 검증 800 ID 목록과 메타데이터 (`train_ids.txt`, `valid_ids.txt`도 있음) |
 
@@ -273,7 +273,7 @@ predict(model, queries, candidates, top_k=5) -> dict
 - 오류 0건. ID `0000`~`3999`가 이미지 4,000장과 1:1로 맞고, 누락·손상·중복 ID·빈 설명이 없다. 이미지는 모두 768×768 RGB PNG다.
 - 완전 중복(파일, 픽셀, 텍스트)이 없다. 그래서 분할은 **스타터 키트 공식 분할(seed 42)과 같다.** 공식 검증 점수와 바로 비교할 수 있다.
 - 참고: 22개 설명에 문단 줄바꿈(`\n\n`)이 있고, 1개 설명에 `’` 문자가 있다. 원본은 그대로 둔다.
-- 근접 중복 후보 115쌍 중 상위 12쌍을 육안으로 확인했다. 모두 중복이 아니라 **속성 하나만 다른 대조 이미지**였다. 텍스트에도 색 결합이나 관계 방향만 바뀐 쌍이 있다.
+- 근접 중복 후보 115쌍 중 상위 12쌍을 Claude가 이미지를 보고 확인했다(팀원 검토 전). 모두 중복이 아니라 **속성 하나만 다른 대조 이미지**였다. 텍스트에도 색 결합이나 관계 방향만 바뀐 쌍이 있다.
 - 임베딩 기반 의미 유사도는 검사하지 않았다.
 
 **실행 방법**
@@ -291,17 +291,17 @@ Colab에서는 `notebooks/02_data_audit_split.ipynb`를 CPU 런타임으로 실�
 
 ## 10. 형제 그룹 분석과 배치 A/B 실험
 
-**발견 (텍스트 파싱 + 육안 확인, 2026-11-21)**
+**발견 (텍스트 파싱 + Claude의 이미지 확인, 2026-11-21)**
 - 물체 **종류** 집합(개수 제외)으로 묶으면 Train이 **4개 또는 8개짜리 그룹**으로 거의 정확히 나뉜다(그룹 656개 중 4개 323, 8개 319). 같은 물체 조합으로 조건을 바꿔 여러 장을 만든 구조다.
 - 그룹 안에서는 한 속성만 바꾼 쌍보다 **두 물체 사이에서 속성을 맞바꾼 쌍**이 많다(색 결합 교차 3,263쌍, 개수 결합 교차 1,196쌍). 개수만 단독으로 다른 쌍은 16개뿐이다.
-- 점검 세트 31쌍을 이미지로 확인했다: 27쌍 일치, 2쌍 부분 일치·확인 어려움(물체가 작음), 1쌍 설명 불일치(2470: '선글라스 아래'를 착용으로 그림). 기록: `reports/siblings/manual_checks.csv`
+- 점검 세트 31쌍을 **Claude가 이미지를 직접 보고** 확인했다(팀원 검토 전): 27쌍 일치, 3쌍 부분 일치·확인 어려움(물체가 작음 등), 1쌍 설명 불일치(2470: '선글라스 아래'를 착용으로 그림). 기록: `reports/siblings/manual_checks.csv` (`checked_by` 열)
 
 **결과물** (`python -m haiku.siblings --data-dir haikuthon-train`, CPU로 1~2분)
 
 | 파일 | 내용 |
 |---|---|
 | [`reports/siblings/summary.md`](reports/siblings/summary.md) | 정의, 기존 수치(1,137/713) 재현과 의미, 조건별 집계, 검증 설정 비교, 샘플러 점검 |
-| `reports/siblings/pairs.csv` | 같은 그룹 안 모든 쌍: 두 설명, 달라진 조건(어느 물체의 무엇), 누락 조건, 단일/복수, 단일 확정/미확인, 결합 교차, 애매 이유, 사람 확인 |
+| `reports/siblings/pairs.csv` | 같은 그룹 안 모든 쌍: 두 설명, 달라진 조건(어느 물체의 무엇), 누락 조건, 단일/복수, 단일 확정/미확인, 결합 교차, 애매 이유, 이미지 확인 결과와 판정자 |
 | `reports/siblings/probe_set.csv`, `probe_set.jpg` | 학습 분할 안 속성별 점검 세트(색·개수 교차·상태·좌우·색 교차) |
 | `reports/siblings/contrast_phrases.csv` | 목표·대조 영어 문구 (**판별력 점검 전용, 정답 캡션·학습 데이터로 쓰지 않음**) |
 | [`splits/split_group_seed42.json`](splits/split_group_seed42.json) | 형제 그룹 단위 분할 (학습 3,200 / 검증 800, 겹치는 그룹 0) |

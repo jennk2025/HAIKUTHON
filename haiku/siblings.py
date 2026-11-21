@@ -12,7 +12,7 @@ torch 없이 동작한다 (numpy, pillow만 사용). 원본 데이터는 읽기�
     reports/siblings/examples.jpg         대표 쌍 이미지 나란히 보기 (육안 확인용)
     reports/siblings/probe_set.csv/.jpg   속성별 점검 세트 (학습 분할 안)
     reports/siblings/contrast_phrases.csv 대조 문구 (판별력 점검 전용, 정답 캡션 아님)
-    reports/siblings/manual_checks.csv    사람이 이미지를 보고 판정한 결과 (실행 시 표에 합침)
+    reports/siblings/manual_checks.csv    이미지를 직접 보고 판정한 결과와 판정자(checked_by) (실행 시 표에 합침)
     splits/split_group_seed42.json        형제 그룹 단위 분할 (그룹 전체가 학습 또는 검증 한쪽)
 
 정의:
@@ -855,26 +855,26 @@ def run(data_dir, report_dir="reports/siblings", split_dir="splits", official_sp
     pairs = build_pairs(rows, parsed, members)
     pair_index = {(p["a"], p["b"]): p for p in pairs}
 
-    # 사람이 이미지를 보고 판정한 결과 (manual_checks.csv) — 다시 실행해도 유지된다
+    # 이미지를 직접 보고 판정한 결과 (manual_checks.csv, checked_by 열에 판정자) — 다시 실행해도 유지된다
     checks = {}
     mc = report_dir / "manual_checks.csv"
     if mc.exists():
         for r in csv.DictReader(mc.open(encoding="utf-8-sig")):
-            checks[(r["id_a"], r["id_b"])] = (r["image_check"], r.get("note", ""))
+            checks[(r["id_a"], r["id_b"])] = (r["image_check"], r.get("note", ""), r.get("checked_by", ""))
 
     # 1) 쌍 표
     with (report_dir / "pairs.csv").open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["group", "id_a", "id_b", "prompt_a", "prompt_b", "diff_class", "single_status", "n_explicit",
                     "n_explicit_object", "clear_for_sampler", "object_categories", "binding_swap", "explicit_diffs",
-                    "missing_diffs", "compatible_diffs", "ambiguous_reason", "image_check(사람)", "image_check_note"])
+                    "missing_diffs", "compatible_diffs", "ambiguous_reason", "image_check", "image_check_note", "checked_by"])
         for p in pairs:
-            chk = checks.get((p["a"], p["b"]), ("", ""))
+            chk = checks.get((p["a"], p["b"]), ("", "", ""))
             w.writerow([p["group"], p["a"], p["b"], p["prompt_a"].replace("\n", " "), p["prompt_b"].replace("\n", " "),
                         p["diff_class"], p["single_status"], p["n_explicit"], p["n_explicit_object"], p["clear"],
                         "|".join(p["object_categories"]), p["binding_swap"], fmt_diffs(p["diffs"], "explicit"),
                         fmt_diffs(p["diffs"], "missing"), fmt_diffs(p["diffs"], "compatible"), p["ambiguous_reason"],
-                        chk[0], chk[1]])
+                        chk[0], chk[1], chk[2]])
     with (report_dir / "parsed.jsonl").open("w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps({"id": r["id"], "group": group_of[r["id"]], **parsed[r["id"]]}, ensure_ascii=False) + "\n")
@@ -963,12 +963,12 @@ def run(data_dir, report_dir="reports/siblings", split_dir="splits", official_sp
         w = csv.writer(f)
         w.writerow(["n", "probe_category", "group", "id_a", "id_b", "prompt_a", "prompt_b", "single_status",
                     "text_result", "binding_swap", "target(id_a에 맞음)", "contrast(id_b에 맞음)",
-                    "image_check(사람)", "image_check_note"])
+                    "image_check", "image_check_note", "checked_by"])
         for k, (pc, p, ph) in enumerate(probe, 1):
-            chk = checks.get((p["a"], p["b"]), ("", ""))
+            chk = checks.get((p["a"], p["b"]), ("", "", ""))
             w.writerow([k, pc, p["group"], p["a"], p["b"], p["prompt_a"].replace("\n", " "), p["prompt_b"].replace("\n", " "),
                         p["single_status"], fmt_diffs(p["diffs"], "explicit"), p["binding_swap"],
-                        ph["target"], ph["contrast"], chk[0], chk[1]])
+                        ph["target"], ph["contrast"], chk[0], chk[1], chk[2]])
     save_probe_sheet(probe, data_dir / "images", report_dir / "probe_set.jpg")
     summary["probe"] = {
         "scope": "그룹 분할 학습 ID 안의 쌍만 (최종 검증 세트는 쓰지 않음)",
@@ -992,7 +992,7 @@ PROBE_CATS = [("color", "색"), ("count", "개수"), ("count_binding_swap", "개
 
 def build_probe_set(pairs, phrase_rows, train_ids, seed, per_cat=6, checked=()):
     """학습 분할 안에서 조건별 대표 쌍. 대조 문구가 만들어진 실제 쌍만 쓴다.
-    사람이 이미 이미지를 확인한 쌍(checked)을 먼저 넣어, 다시 실행해도 점검 세트가 크게 바뀌지 않게 한다."""
+    이미 이미지를 확인한 쌍(checked)을 먼저 넣어, 다시 실행해도 점검 세트가 크게 바뀌지 않게 한다."""
     by_pair = defaultdict(list)
     for r in phrase_rows:
         by_pair[(r["id_a"], r["id_b"])].append(r)
@@ -1091,7 +1091,7 @@ def render_md(s):
     a("|---|---|---|---|---|---|")
     for e in s["examples"]:
         a(f"| {e['n']} | {e['category']} | {e['a']} | {e['b']} | {e['group']} | {e['explicit']} |")
-    a("\n육안 확인 결과는 `manual_checks.csv`에 적고, 실행할 때 `pairs.csv`·`probe_set.csv`의 `image_check(사람)` 열로 합친다.")
+    a("\n이미지 확인 결과는 `manual_checks.csv`에 판정자(`checked_by`)와 함께 적고, 실행할 때 `pairs.csv`·`probe_set.csv`의 `image_check` 열로 합친다. 현재 판정은 모두 Claude가 이미지를 보고 한 것이며(`checked_by = Claude`), 팀원 검토는 아직 하지 않았다.")
     pb = s.get("probe")
     if pb:
         a("\n## 7. 단일 속성 쌍, 점검 세트, 대조 문구 (후속 재정렬 실험용 전처리)\n")

@@ -1,5 +1,5 @@
 {
- "generated_at": "2026-11-21T17:37:44",
+ "generated_at": "2026-11-21T18:01:54",
  "parse": {
   "n": 4000,
   "with_objects": 4000,
@@ -120,7 +120,7 @@
  },
  "group_split": {
   "name": "split_group_seed42",
-  "created_at": "2026-11-21T17:37:43",
+  "created_at": "2026-11-21T18:01:54",
   "seed": 42,
   "method": "형제 그룹(물체 종류 집합, 개수 제외) 단위로 무작위 배정. 검증 목표 20%",
   "n_train": 3200,
@@ -466,6 +466,6 @@
    "relation_left_right": 6,
    "color_binding_swap": 6
   },
-  "manual_checks_loaded": 36
+  "manual_checks_loaded": 37
  }
 }

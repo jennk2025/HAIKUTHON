@@ -1,6 +1,6 @@
 # 형제 그룹 분석과 그룹 분할
 
-- 생성: 2026-11-21T17:37:44 · 원본은 읽기만 함 · 판정은 **텍스트 기준 규칙 파서**(근사치)
+- 생성: 2026-11-21T18:01:54 · 원본은 읽기만 함 · 판정은 **텍스트 기준 규칙 파서**(근사치)
 - 파일: `pairs.csv`(쌍 표), `parsed.jsonl`(설명별 파싱 결과), `examples.jpg`(대표 쌍 이미지), `../../splits/split_group_seed42.json`
 
 ## 1. 기존 수치(관계 1,137 / 색 713) 재현
@@ -103,7 +103,7 @@
 | 26 | none | 2112 | 2908 | G0606 |  |
 | 27 | none | 1324 | 2443 | G0168 |  |
 
-육안 확인 결과는 `manual_checks.csv`에 적고, 실행할 때 `pairs.csv`·`probe_set.csv`의 `image_check(사람)` 열로 합친다.
+이미지 확인 결과는 `manual_checks.csv`에 판정자(`checked_by`)와 함께 적고, 실행할 때 `pairs.csv`·`probe_set.csv`의 `image_check` 열로 합친다. 현재 판정은 모두 Claude가 이미지를 보고 한 것이며(`checked_by = Claude`), 팀원 검토는 아직 하지 않았다.
 
 ## 7. 단일 속성 쌍, 점검 세트, 대조 문구 (후속 재정렬 실험용 전처리)
 
