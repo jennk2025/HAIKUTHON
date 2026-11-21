@@ -34,31 +34,38 @@ class BlipITM:
 
     @torch.inference_mode()
     def image_embeds(self, paths, bs=32):
-        """후보 이미지 → BLIP 비전 특징 (n, 토큰, 차원). CPU 메모리에 fp16으로 보관."""
-        out = []
+        """후보 이미지 → BLIP 비전 특징 (n, 토큰, 차원). CPU 메모리에 fp16으로 보관 (미리 할당해 두 배 사용을 막음)."""
+        store = None
         for s in range(0, len(paths), bs):
             ims = []
             for p in paths[s:s + bs]:
                 with Image.open(p) as im:
                     ims.append(im.convert("RGB"))
             px = self.proc.image_processor(images=ims, return_tensors="pt")["pixel_values"].to(self.device, self.dtype)
-            out.append(self.model.vision_model(pixel_values=px).last_hidden_state.half().cpu())
-        return torch.cat(out)
+            h = self.model.vision_model(pixel_values=px).last_hidden_state.half().cpu()
+            if store is None:
+                store = torch.empty((len(paths),) + tuple(h.shape[1:]), dtype=torch.float16)
+            store[s:s + len(h)] = h
+        return store
 
     @torch.inference_mode()
-    def score(self, texts, img_feats, bs=64):
-        """(문장 i, 이미지 특징 i) 쌍마다 매칭 로짓 차이."""
+    def score_idx(self, texts, idx, feats, bs=64):
+        """(문장 i, 이미지 특징 feats[idx[i]]) 쌍마다 매칭 로짓 차이. 특징은 묶음마다 꺼내 써서 메모리를 아낀다."""
         out = []
         for s in range(0, len(texts), bs):
             tok = self.proc.tokenizer(texts[s:s + bs], padding=True, truncation=True, max_length=72,
                                       return_tensors="pt").to(self.device)
-            img = img_feats[s:s + bs].to(self.device, self.dtype)
+            img = feats[idx[s:s + bs]].to(self.device, self.dtype)
             att = torch.ones(img.shape[:-1], dtype=torch.long, device=self.device)
             h = self.model.text_encoder(input_ids=tok["input_ids"], attention_mask=tok["attention_mask"],
                                         encoder_hidden_states=img, encoder_attention_mask=att).last_hidden_state
             logit = self.model.itm_head(h[:, 0, :]).float()
             out.append((logit[:, 1] - logit[:, 0]).cpu())
-        return torch.cat(out)
+        return torch.cat(out) if out else torch.zeros(0)
+
+    def score(self, texts, img_feats, bs=64):
+        """(문장 i, 이미지 특징 i) 쌍마다 매칭 로짓 차이."""
+        return self.score_idx(texts, list(range(len(texts))), img_feats, bs)
 
 
 # ----------------------------------------------------------------------------- 2×2 점검
@@ -130,7 +137,7 @@ def run_itm_experiment(rows, split, pairs_csv, contrast_csv, siglip_img, siglip_
     out["blip_img_per_sec"] = round(len(ids) / out["blip_image_sec"], 1)
 
     def itm_fn(texts, img_ids):
-        return itm.score(texts, feats[[pos[i] for i in img_ids]])
+        return itm.score_idx(texts, [pos[i] for i in img_ids], feats)
 
     def siglip_fn(texts, img_ids):
         T = siglip_txt_phr(texts)
