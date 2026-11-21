@@ -1,0 +1,9 @@
+# Colab / Kaggle 작업용 패키지.
+# torch, torchvision, pillow, numpy는 Colab·Kaggle 기본 설치본을 그대로 쓴다(재설치하면 런타임 재시작이 필요).
+# 아래 버전은 스타터 키트 sample_submission/requirements.txt에 적힌 채점 서버 기본 설치 버전과 맞춘 것이다.
+transformers==5.22.2
+safetensors==0.8.0
+sentencepiece==0.2.3
+huggingface_hub>=1.0
+tqdm
+matplotlib

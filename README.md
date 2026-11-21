@@ -258,7 +258,37 @@ predict(model, queries, candidates, top_k=5) -> dict
 - 실패한 시도도 적는다. 발표에서 "왜 이 방법을 버렸는지"의 근거가 된다.
 - 짧게 쓴다. 자세한 내용은 커밋과 코드에 남긴다.
 
-### 로컬 폴더 (git에 올리지 않음)
+---
+
+## 9. 작업 환경 (Colab / Kaggle)
+
+학습은 무료 Colab / Kaggle GPU에서만 한다(공식 규정). 노트북을 열고 위에서부터 실행하면 저장소 코드, Train 데이터, 스타터 키트가 한 번에 준비된다.
+
+| 노트북 | 내용 | 열기 |
+|---|---|---|
+| `notebooks/00_colab_setup.ipynb` | 환경 준비, 데이터 확인, 자유 작업 공간 | [Colab](https://colab.research.google.com/github/jennk2025/HAIKUTHON/blob/main/notebooks/00_colab_setup.ipynb) |
+| `notebooks/01_baseline_repro.ipynb` | 공식 baseline 재현과 기본 측정 (exp000) | [Colab](https://colab.research.google.com/github/jennk2025/HAIKUTHON/blob/main/notebooks/01_baseline_repro.ipynb) |
+
+**데이터 보관 (Colab)**
+- 처음 실행할 때 Hugging Face에서 받아 `/content/work`에 두고, Drive `MyDrive/HAIKUTHON/haikuthon-train.tar`(약 5GB)로 저장한다.
+- 다음 세션부터는 Drive의 tar를 `/content/work`로 풀어서 쓴다. Drive에서 PNG를 직접 읽으면 느리다.
+- 실험 결과 JSON은 Drive `MyDrive/HAIKUTHON/results/`에 남는다.
+- Kaggle에서는 Settings에서 Internet을 켜야 데이터를 받을 수 있다.
+
+**저장소 구조**
+
+```
+haiku/                  공용 코드
+  setup_data.py         환경 감지, 데이터·스타터 키트 준비, Drive 캐시
+  data.py               데이터 읽기, 공식 분할(시드 42, 3,200 / 800), predict() 입력 형식
+  metrics.py            공식 점수, Hit@K, 순위 분포, predict() 결과 검사
+  retrieval.py          SigLIP 임베딩, 전체 순위 계산
+  timing.py             시간·VRAM 측정, Test 규모 입력, 결과 저장
+notebooks/              Colab / Kaggle 노트북
+requirements-colab.txt  작업용 패키지 (채점 서버 버전에 맞춤)
+```
+
+**로컬 폴더 (git에 올리지 않음)**
 - `haikuthon-train/`: Train 데이터와 `starterkit.zip` 원본
 - `_starterkit/`: 스타터 키트 압축 해제본
 
