@@ -47,7 +47,30 @@ def negatives_for(q, group_of, members, pool, pool_list, n, rng):
     return out
 
 
-def train_itm(rows, train_ids, args, device):
+def retrieval_negatives(rows, ids, img_fn, txt_fn, lam_cond=3.2, K=10):
+    """학습 질의마다 '추론 때 BLIP이 실제로 보게 될 후보' = SigLIP 검색 + 조건 재정렬 상위 K장 (정답 제외, 어려운 순).
+    후보는 같은 학습 이미지 집합 안에서만 고른다."""
+    from haiku.combo import prepare
+    from haiku.rerank import PhraseBank, all_phrases, extract_conditions
+    by_id = {r["id"]: r for r in rows}
+    ids = list(ids)
+    pos = {i: k for k, i in enumerate(ids)}
+    prompts = {i: by_id[i]["prompt"] for i in ids}
+    img = img_fn([by_id[i]["image_path"] for i in ids])
+    txt = txt_fn([prompts[i] for i in ids])
+    conds = {i: extract_conditions(prompts[i]) for i in ids}
+    bank = PhraseBank(txt_fn)
+    bank.add([p for i in ids for p in all_phrases(conds[i])])
+    items, _ = prepare(ids, ids, txt, img, pos, conds, bank, lam_cond, K, None, None, prompts, 1)
+    out = {it["q"]: [ids[j] for j in it["idxB"] if ids[j] != it["q"] and by_id[ids[j]]["prompt"] != prompts[it["q"]]]
+           for it in items}
+    hit = sum(it["gold"] in it["idxB"][:1] for it in items) / max(len(items), 1)
+    print(f"검색 후보 오답 만들기: 질의 {len(items)}개, 후보 {K}장 (학습 이미지 안에서 1위 정답률 {hit:.3f})", flush=True)
+    return out
+
+
+def train_itm(rows, train_ids, args, device, neg_pool=None):
+    """neg_pool: {질의 ID: [오답 후보 ID, 어려운 순]} 이 있으면 앞에서 n_hard개를 먼저 쓰고 나머지는 형제 오답으로 채운다."""
     from transformers import AutoProcessor, BlipForImageTextRetrieval
     by_id = {r["id"]: r for r in rows}
     parsed = {r["id"]: parse_prompt(r["prompt"]) for r in rows}
@@ -88,6 +111,14 @@ def train_itm(rows, train_ids, args, device):
             texts, img_idx = [], []
             for q in qs:
                 negs = negatives_for(q, group_of, members, pool, pool_list, args.negatives, rng)
+                if neg_pool and q in neg_pool:
+                    hard = [x for x in neg_pool[q] if x in pool][:getattr(args, "n_hard", 5)]
+                    rest = [x for x in negs if x not in hard]
+                    while len(hard) + len(rest) < args.negatives:
+                        x = rng.choice(pool_list)
+                        if x != q and x not in hard and x not in rest:
+                            rest.append(x)
+                    negs = hard + rest[:args.negatives - len(hard)]
                 n_sib += sum(group_of[x] == group_of[q] for x in negs)
                 texts += [by_id[q]["prompt"]] * (1 + len(negs))
                 img_idx += [pos[q]] + [pos[x] for x in negs]
@@ -161,6 +192,9 @@ def main():
     ap.add_argument("--final", action="store_true", help="4,000쌍 전체로 학습해 저장 (평가 없음)")
     ap.add_argument("--smoke", action="store_true", help="작은 점검 (CPU 가능)")
     ap.add_argument("--smoke-siglip-dir", default=None)
+    ap.add_argument("--neg-mode", choices=["sibling", "retrieval"], default="sibling",
+                    help="retrieval: 추론 때 BLIP이 보는 후보(SigLIP+조건 재정렬 상위 10장)를 오답으로 먼저 사용")
+    ap.add_argument("--n-hard", type=int, default=5)
     args = ap.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     rows = load_rows(args.data_dir)
@@ -169,7 +203,15 @@ def main():
 
     if args.final:
         train_ids = [r["id"] for r in rows]
-        model, proc, info = train_itm(rows, train_ids, args, device)
+        neg_pool = None
+        if args.neg_mode == "retrieval":
+            from haiku.combo import _siglip
+            img_fn, txt_fn = _siglip(args.siglip, device)
+            neg_pool = retrieval_negatives(rows, train_ids, img_fn, txt_fn)
+            del img_fn, txt_fn
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        model, proc, info = train_itm(rows, train_ids, args, device, neg_pool)
         save = args.out_dir / "blip_itm_ft"
         model.half().save_pretrained(save)
         proc.save_pretrained(save)
