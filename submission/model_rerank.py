@@ -87,6 +87,7 @@ def predict(model, queries, candidates, top_k=5):
     cfg = model["cfg"]
     K, method, lam = int(cfg.get("K", 10)), cfg.get("method", "B"), float(cfg.get("lam", 0.0))
     reliability, tau = cfg.get("reliability", {}), cfg.get("tau")
+    kinds = set(cfg["kinds"]) if cfg.get("kinds") else None          # 쓸 조건 종류 (없으면 전부)
     image_ids = [c["image_id"] for c in candidates]
     image_vecs = encode_images(model, [c["image_path"] for c in candidates])
     # 재정렬 여부는 여기서 한 번만 정한다 (질의 내용과 무관, 모든 질의에 동일)
@@ -97,7 +98,8 @@ def predict(model, queries, candidates, top_k=5):
         batch = queries[s:s + TXT_BATCH]
         text_vecs = encode_texts(model, [q["prompt"] for q in batch])
         top = (text_vecs @ image_vecs.T).topk(max(K, top_k), dim=1)
-        conds = [extract_conditions(q["prompt"]) for q in batch] if use_rerank else None
+        conds = [[c for c in extract_conditions(q["prompt"]) if kinds is None or c["kind"] in kinds]
+                 for q in batch] if use_rerank else None
         if use_rerank:
             bank.add([p for c in conds for p in all_phrases(c)])
         for i, q in enumerate(batch):

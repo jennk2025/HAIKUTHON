@@ -55,6 +55,22 @@ def extract_conditions(prompt):
         if cnt in (1, 2, 3):
             conds.append({"kind": "count", "key": f"count[{name}]={cnt}", "target": _np(name, cnt),
                           "contrasts": [_np(name, c) for c in (1, 2, 3) if c != cnt]})
+    # 맞바꿈 점검: 한 물체의 속성을, 같은 질의의 '다른 물체가 가진 값'과 대조한다.
+    # (형제 이미지는 두 물체 사이에서 색·개수를 맞바꾼 경우가 많다. 결합 문장 대신 SigLIP이 잘 읽는 단순 문구로 검사)
+    for cat in ("color", "pattern", "material"):
+        single = {n: o["attrs"][cat][0] for n, o in objs.items() if len(o["attrs"].get(cat, [])) == 1}
+        for name, v in single.items():
+            others = sorted({w for n2, w in single.items() if n2 != name and w != v})
+            if others:
+                cnt = objs[name]["count"]
+                conds.append({"kind": f"{cat}_x", "key": f"{cat}_x[{name}]={v}", "target": _np(name, cnt, v),
+                              "contrasts": [_np(name, cnt, w) for w in others]})
+    counts = {n: o["count"] for n, o in objs.items() if o["count"] in (1, 2, 3)}
+    for name, c in counts.items():
+        others = sorted({c2 for n2, c2 in counts.items() if n2 != name and c2 != c})
+        if others:
+            conds.append({"kind": "count_x", "key": f"count_x[{name}]={c}", "target": _np(name, c),
+                          "contrasts": [_np(name, c2) for c2 in others]})
     colored = [n for n in objs if len(objs[n]["attrs"].get("color", [])) == 1]
     for a, b in combinations(sorted(colored), 2):
         ca, cb = objs[a]["attrs"]["color"][0], objs[b]["attrs"]["color"][0]
@@ -299,6 +315,74 @@ def run_experiment(rows, split, contrast_csv, encode_images, encode_texts, K_lis
                                "rerank_sec_800q": round(sec, 2)}
         res["val_examples_C"] = _examples(val, conds, best["C"], reliability, va)
         out["by_K"][str(K)] = res
+    return out
+
+
+ATTR_KINDS = {"color", "pattern", "material", "shape", "state", "pose", "count"}
+X_KINDS = {"color_x", "pattern_x", "material_x", "count_x"}
+BIND_KINDS = {"color_binding", "count_binding"}
+REL_KINDS = {"relation_left_right", "relation_above_below", "relation_on_inside"}
+VARIANTS = {
+    "B_R1(기존 B)": ATTR_KINDS | BIND_KINDS | REL_KINDS,
+    "B_속성만": ATTR_KINDS,
+    "B_속성+맞바꿈": ATTR_KINDS | X_KINDS,
+    "B_맞바꿈만": X_KINDS,
+    "B_속성+맞바꿈+관계": ATTR_KINDS | X_KINDS | REL_KINDS,
+    "B_전체": ATTR_KINDS | X_KINDS | BIND_KINDS | REL_KINDS,
+}
+
+
+def _ranks_kinds(items, conds_all, kinds, lam):
+    """조건 종류를 골라 B(같은 비중)로 재정렬한 순위. 조건 점수는 미리 계산한 것을 골라 쓴다."""
+    ranks = []
+    for it in items:
+        cs = conds_all[it["q"]]
+        mask = [c["kind"] in kinds for c in cs]
+        new = it["s"]
+        if lam > 0 and any(mask):
+            sel = [c for c, m in zip(cs, mask) if m]
+            M = it["M"][torch.tensor(mask, device=it["M"].device)]
+            new = rerank_scores(it["s"], sel, M, "B", lam, {})
+        order = it["idx"][new.argsort(descending=True)]
+        hit = (order == it["gold"]).nonzero()
+        ranks.append(int(hit[0, 0]) + 1 if len(hit) else it["base_rank"])
+    return ranks
+
+
+def run_variants(rows, split, encode_images, encode_texts, K=10, variants=None,
+                 lam_grid=(0.8, 1.6, 3.2, 6.4, 12.8, 25.6, 51.2)):
+    """조건 종류 묶음별 B 재정렬 비교. λ는 학습 분할(개발)에서 묶음마다 고르고, 검증에서 한 번만 보고한다."""
+    from haiku.metrics import metrics_from_ranks
+    variants = variants or VARIANTS
+    by_id = {r["id"]: r for r in rows}
+    tr, va = list(split["train_ids"]), list(split["valid_ids"])
+    ids = tr + va
+    pos = {i: k for k, i in enumerate(ids)}
+    img = encode_images([by_id[i]["image_path"] for i in ids])
+    txt = encode_texts([by_id[i]["prompt"] for i in ids])
+    conds = {i: extract_conditions(by_id[i]["prompt"]) for i in ids}
+    bank = PhraseBank(encode_texts)
+    bank.add([p for i in ids for p in all_phrases(conds[i])])
+    kinds = {}
+    for i in ids:
+        for c in conds[i]:
+            kinds[c["kind"]] = kinds.get(c["kind"], 0) + 1
+    t0 = time.perf_counter()
+    dev = _prepare(tr, tr, txt, img, pos, conds, bank, K)
+    val = _prepare(va, va, txt, img, pos, conds, bank, K)
+    out = {"condition_kinds": kinds, "unique_phrases": len(bank.index), "phrase_encode_sec": round(bank.encode_sec, 1),
+           "prepare_sec": round(time.perf_counter() - t0, 1), "variants": {}}
+    base = _ranks_kinds(val, conds, set(), 0)
+    out["val_A"] = {k: round(v, 4) for k, v in metrics_from_ranks(base).items() if k in ("score", "recall@1")}
+    for name, ks in variants.items():
+        sc = {lam: _score(_ranks_kinds(dev, conds, ks, lam)) for lam in lam_grid}
+        lam = max(sc, key=sc.get)
+        rk = _ranks_kinds(val, conds, ks, lam)
+        met = metrics_from_ranks(rk)
+        out["variants"][name] = {"kinds": sorted(ks), "lam": lam, "dev_by_lam": {str(k): round(v, 4) for k, v in sc.items()},
+                                 "val": {"score": round(met["score"], 4), "recall@1": round(met["recall@1"], 4),
+                                         "wrong_to_right@1": sum(b > 1 and r == 1 for b, r in zip(base, rk)),
+                                         "right_to_wrong@1": sum(b == 1 and r > 1 for b, r in zip(base, rk))}}
     return out
 
 
