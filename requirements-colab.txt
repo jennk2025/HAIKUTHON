@@ -4,6 +4,7 @@
 transformers==5.22.2
 safetensors==0.8.0
 sentencepiece==0.2.3
+protobuf
 huggingface_hub>=1.0
 tqdm
 matplotlib

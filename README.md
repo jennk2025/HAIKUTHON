@@ -289,7 +289,38 @@ Colab에서는 `notebooks/02_data_audit_split.ipynb`를 CPU 런타임으로 실�
 
 ---
 
-## 10. 작업 환경 (Colab / Kaggle)
+## 10. 형제 그룹 분석과 배치 A/B 실험
+
+**발견 (텍스트 파싱 + 육안 확인, 2026-11-21)**
+- 물체 **종류** 집합(개수 제외)으로 묶으면 Train이 **4개 또는 8개짜리 그룹**으로 거의 정확히 나뉜다(그룹 656개 중 4개 323, 8개 319). 같은 물체 조합으로 조건을 바꿔 여러 장을 만든 구조다.
+- 그룹 안에서는 한 속성만 바꾼 쌍보다 **두 물체 사이에서 속성을 맞바꾼 쌍**이 많다(색 결합 교차 3,263쌍, 개수 결합 교차 1,196쌍). 개수만 단독으로 다른 쌍은 16개뿐이다.
+- 점검 세트 31쌍을 이미지로 확인했다: 27쌍 일치, 2쌍 부분 일치·확인 어려움(물체가 작음), 1쌍 설명 불일치(2470: '선글라스 아래'를 착용으로 그림). 기록: `reports/siblings/manual_checks.csv`
+
+**결과물** (`python -m haiku.siblings --data-dir haikuthon-train`, CPU로 1~2분)
+
+| 파일 | 내용 |
+|---|---|
+| [`reports/siblings/summary.md`](reports/siblings/summary.md) | 정의, 기존 수치(1,137/713) 재현과 의미, 조건별 집계, 검증 설정 비교, 샘플러 점검 |
+| `reports/siblings/pairs.csv` | 같은 그룹 안 모든 쌍: 두 설명, 달라진 조건(어느 물체의 무엇), 누락 조건, 단일/복수, 단일 확정/미확인, 결합 교차, 애매 이유, 사람 확인 |
+| `reports/siblings/probe_set.csv`, `probe_set.jpg` | 학습 분할 안 속성별 점검 세트(색·개수 교차·상태·좌우·색 교차) |
+| `reports/siblings/contrast_phrases.csv` | 목표·대조 영어 문구 (**판별력 점검 전용, 정답 캡션·학습 데이터로 쓰지 않음**) |
+| [`splits/split_group_seed42.json`](splits/split_group_seed42.json) | 형제 그룹 단위 분할 (학습 3,200 / 검증 800, 겹치는 그룹 0) |
+
+**검증 설정 비교** (모델 없이 계산한 후보 구성)
+
+| 설정 | 후보 | 질의당 형제 오답 | 형제 오답이 있는 질의 |
+|---|---|---|---|
+| 공식 분할 검증 (스타터 키트와 같음) | 800 | 1.19 | 69.6% |
+| 기존 로컬 검증 1:2 (01 노트북, 검증 800 + 학습 800) | 1,600 | 2.37 | 90.4% |
+| 그룹 분할 검증 | 800 | 5.70 | 99.9% |
+
+그룹 분할 점수는 처음 보는 물체 조합에 대한 일반화도 함께 잰다. 공식 분할과의 차이를 모두 형제 오답 때문으로 해석하지 않는다.
+
+**A/B 실험** (`python -m haiku.sibling_ab`, Colab GPU): 배치 구성만 바꾼다. A는 무작위 배치, B는 배치마다 형제 비교 쌍 최대 4개와 일반 샘플이다. 모델 초기값, 학습 대상(헤드), 스텝, 해상도, 증강 없음, 에포크당 ID와 노출 횟수는 같다. 실행 방법은 모듈 docstring에 있다. 로컬에서는 작은 점검(smoke)만 실행했다.
+
+---
+
+## 11. 작업 환경 (Colab / Kaggle)
 
 학습은 무료 Colab / Kaggle GPU에서만 한다(공식 규정). 노트북을 열고 위에서부터 실행하면 저장소 코드, Train 데이터, 스타터 키트가 한 번에 준비된다.
 
@@ -314,6 +345,8 @@ haiku/                  공용 코드
   setup_data.py         환경 감지, 데이터·스타터 키트 준비, Drive 캐시
   audit.py              데이터 점검 (python -m haiku.audit)
   split.py              검증 분할 생성 (python -m haiku.split)
+  siblings.py           형제 그룹 파싱·비교 쌍·그룹 분할·배치 샘플러 (python -m haiku.siblings)
+  sibling_ab.py         배치 구성 A/B 학습 실험 (python -m haiku.sibling_ab)
   data.py               데이터 읽기, 분할 읽기(load_split), 검증 ID 누수 검사, predict() 입력 형식
   metrics.py            공식 점수, Hit@K, 순위 분포, predict() 결과 검사
   retrieval.py          SigLIP 임베딩, 전체 순위 계산

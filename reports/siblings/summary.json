@@ -1,0 +1,471 @@
+{
+ "generated_at": "2026-11-21T17:37:44",
+ "parse": {
+  "n": 4000,
+  "with_objects": 4000,
+  "objects_per_prompt": 2.74,
+  "relations_per_prompt": 1.4,
+  "prompts_with_flags": 677,
+  "flag_counts": {
+   "multi_instance": 475,
+   "self_relation": 146,
+   "unbound_attr": 95,
+   "rel_no_object": 65,
+   "unknown_noun": 30,
+   "count_inferred": 30,
+   "rel_no_subject": 27
+  },
+  "unknown_nouns": {
+   "is": 15,
+   "which": 9,
+   "colored": 2,
+   "photograph": 1,
+   "from": 1,
+   "appear": 1,
+   "solid": 1
+  }
+ },
+ "groups": {
+  "n_groups": 656,
+  "size_dist": {
+   "1": 1,
+   "2": 4,
+   "4": 323,
+   "7": 1,
+   "8": 319,
+   "12": 2,
+   "16": 3,
+   "20": 1,
+   "24": 2
+  },
+  "n_with_siblings": 3999
+ },
+ "pairs": {
+  "n_pairs": 12129,
+  "diff_class": {
+   "복수": 7978,
+   "단일": 3722,
+   "명시 차이 없음": 429
+  },
+  "clear": 9185,
+  "explicit_by_category_overlapping": {
+   "color": 7026,
+   "relation_direction": 3704,
+   "relation_kind": 2542,
+   "count": 1626,
+   "pose": 1367,
+   "pattern": 1349,
+   "style": 736,
+   "material": 620,
+   "lighting": 560,
+   "location": 480,
+   "view": 304,
+   "state": 281,
+   "shape": 183
+  },
+  "single_explicit_object_diff": {
+   "color": 1204,
+   "relation_direction": 1129,
+   "relation_kind": 467,
+   "pose": 346,
+   "pattern": 305,
+   "material": 149,
+   "state": 73,
+   "shape": 33,
+   "count": 16
+  },
+  "missing_by_category": {
+   "relation_missing": 3918,
+   "color": 1174,
+   "pattern": 1061,
+   "pose": 712,
+   "material": 267,
+   "state": 166,
+   "shape": 109,
+   "view": 7
+  }
+ },
+ "legacy": {
+  "scope": "공개 train 4,000쌍 전체 (분할 구분 없음)",
+  "n_groups": 1547,
+  "n_with_siblings": 3220,
+  "n_pairs": 6883,
+  "pair_counting": "같은 그룹 안에서 A<B 순서로 한 번만 셈 (A–B와 B–A 중복 없음)",
+  "single_category_exclusive": {
+   "관계": 1137,
+   "색": 713,
+   "화풍": 271,
+   "자세·상태": 193,
+   "무늬": 189,
+   "재질": 122,
+   "조명": 34,
+   "개수": 34,
+   "모양": 13,
+   "시점": 1
+  },
+  "category_overlapping": {
+   "관계": 3681,
+   "색": 2226,
+   "화풍": 1664,
+   "자세·상태": 914,
+   "무늬": 716,
+   "재질": 442,
+   "조명": 382,
+   "개수": 219,
+   "시점": 145,
+   "모양": 124,
+   "객체·장소": 84
+  },
+  "no_content_difference": 1006
+ },
+ "group_split": {
+  "name": "split_group_seed42",
+  "created_at": "2026-11-21T17:37:43",
+  "seed": 42,
+  "method": "형제 그룹(물체 종류 집합, 개수 제외) 단위로 무작위 배정. 검증 목표 20%",
+  "n_train": 3200,
+  "n_valid": 800,
+  "n_groups_train": 522,
+  "n_groups_valid": 134,
+  "leak_check": {
+   "overlap_ids": 0,
+   "groups_crossing": 0,
+   "crossing_examples": []
+  },
+  "rules": [
+   "검증 ID는 학습·증강·hard negative 채굴에 쓰지 않는다."
+  ]
+ },
+ "validation_settings": {
+  "공식 분할 검증 (후보 800, 스타터 키트와 같음)": {
+   "n_queries": 800,
+   "n_gallery": 800,
+   "mean_siblings_per_query": 1.192,
+   "queries_with_sibling": 557,
+   "ratio_with_sibling": 0.6963,
+   "max_siblings": 6
+  },
+  "기존 로컬 검증 1:2 (후보 1,600 = 검증 800 + 학습 800)": {
+   "n_queries": 800,
+   "n_gallery": 1600,
+   "mean_siblings_per_query": 2.373,
+   "queries_with_sibling": 723,
+   "ratio_with_sibling": 0.9038,
+   "max_siblings": 10
+  },
+  "그룹 분할 검증 (검증 이미지 전체)": {
+   "n_queries": 800,
+   "n_gallery": 800,
+   "mean_siblings_per_query": 5.702,
+   "queries_with_sibling": 799,
+   "ratio_with_sibling": 0.9988,
+   "max_siblings": 11
+  }
+ },
+ "sampler_check": {
+  "bs": 16,
+  "pairs_per_batch": 4,
+  "clear_pairs_in_train": 7345,
+  "chosen_pairs_epoch0": 800,
+  "same_ids_and_exposure": true,
+  "same_batch_sizes": true,
+  "A": {
+   "n_batches": 200,
+   "sibling_pairs_in_batches": 46,
+   "clear_pairs_in_batches": 37,
+   "clear_pairs_per_batch": 0.185,
+   "categories": {
+    "color": 16,
+    "relation_direction": 13,
+    "relation_kind": 9,
+    "pattern": 5,
+    "count": 4,
+    "pose": 4,
+    "material": 3,
+    "shape": 1
+   }
+  },
+  "B": {
+   "n_batches": 200,
+   "sibling_pairs_in_batches": 854,
+   "clear_pairs_in_batches": 841,
+   "clear_pairs_per_batch": 4.205,
+   "categories": {
+    "color": 506,
+    "relation_direction": 344,
+    "relation_kind": 150,
+    "pattern": 93,
+    "count": 90,
+    "pose": 79,
+    "material": 43,
+    "state": 15,
+    "shape": 12
+   }
+  },
+  "valid_ids_in_batches": 0
+ },
+ "examples": [
+  {
+   "n": 1,
+   "category": "color",
+   "a": "2729",
+   "b": "3514",
+   "group": "G0562",
+   "explicit": "색[pumpkin] orange→green"
+  },
+  {
+   "n": 2,
+   "category": "color",
+   "a": "3170",
+   "b": "3860",
+   "group": "G0190",
+   "explicit": "색[dumbbell] red→black"
+  },
+  {
+   "n": 3,
+   "category": "color",
+   "a": "1730",
+   "b": "2248",
+   "group": "G0465",
+   "explicit": "색[cone] pink→green"
+  },
+  {
+   "n": 4,
+   "category": "relation_direction",
+   "a": "1685",
+   "b": "2785",
+   "group": "G0612",
+   "explicit": "관계 방향[block–kick scooter] block left_of kick scooter→kick scooter left_of block"
+  },
+  {
+   "n": 5,
+   "category": "relation_direction",
+   "a": "0314",
+   "b": "3326",
+   "group": "G0256",
+   "explicit": "관계 방향[horse–truck] truck left_of horse→horse left_of truck"
+  },
+  {
+   "n": 6,
+   "category": "relation_direction",
+   "a": "1795",
+   "b": "3765",
+   "group": "G0026",
+   "explicit": "관계 방향[baseball bat–camera] baseball bat left_of camera→camera left_of baseball bat"
+  },
+  {
+   "n": 7,
+   "category": "relation_kind",
+   "a": "0234",
+   "b": "3512",
+   "group": "G0198",
+   "explicit": "관계 종류[eraser–flower pot] eraser inside flower pot→eraser next_to flower pot"
+  },
+  {
+   "n": 8,
+   "category": "relation_kind",
+   "a": "2547",
+   "b": "3627",
+   "group": "G0445",
+   "explicit": "관계 종류[cylinder–food container] cylinder inside food container→cylinder next_to food container"
+  },
+  {
+   "n": 9,
+   "category": "relation_kind",
+   "a": "1572",
+   "b": "2069",
+   "group": "G0422",
+   "explicit": "관계 종류[bench–jacket] jacket on bench→bench next_to jacket"
+  },
+  {
+   "n": 10,
+   "category": "pattern",
+   "a": "1738",
+   "b": "2558",
+   "group": "G0317",
+   "explicit": "무늬[sofa] solid-colored→striped"
+  },
+  {
+   "n": 11,
+   "category": "pattern",
+   "a": "1272",
+   "b": "1799",
+   "group": "G0564",
+   "explicit": "무늬[sneaker] striped→solid-colored"
+  },
+  {
+   "n": 12,
+   "category": "pattern",
+   "a": "2410",
+   "b": "3125",
+   "group": "G0487",
+   "explicit": "무늬[bowl] solid-colored→striped"
+  },
+  {
+   "n": 13,
+   "category": "material",
+   "a": "1803",
+   "b": "2754",
+   "group": "G0578",
+   "explicit": "재질[suitcase] plastic→metal"
+  },
+  {
+   "n": 14,
+   "category": "material",
+   "a": "0269",
+   "b": "3539",
+   "group": "G0224",
+   "explicit": "재질[desk] wooden→metal"
+  },
+  {
+   "n": 15,
+   "category": "material",
+   "a": "1931",
+   "b": "3530",
+   "group": "G0319",
+   "explicit": "재질[fork] metal→wooden"
+  },
+  {
+   "n": 16,
+   "category": "pose",
+   "a": "1447",
+   "b": "3107",
+   "group": "G0158",
+   "explicit": "자세[donkey] standing→lying"
+  },
+  {
+   "n": 17,
+   "category": "pose",
+   "a": "2511",
+   "b": "3241",
+   "group": "G0333",
+   "explicit": "자세[person] sitting→lying"
+  },
+  {
+   "n": 18,
+   "category": "pose",
+   "a": "0888",
+   "b": "2090",
+   "group": "G0116",
+   "explicit": "자세[person] standing→kneeling"
+  },
+  {
+   "n": 19,
+   "category": "state",
+   "a": "0731",
+   "b": "1980",
+   "group": "G0438",
+   "explicit": "상태[cabinet] open→closed"
+  },
+  {
+   "n": 20,
+   "category": "state",
+   "a": "0091",
+   "b": "0096",
+   "group": "G0083",
+   "explicit": "상태[cabinet] closed→open"
+  },
+  {
+   "n": 21,
+   "category": "state",
+   "a": "2142",
+   "b": "3340",
+   "group": "G0156",
+   "explicit": "상태[backpack] closed→open"
+  },
+  {
+   "n": 22,
+   "category": "shape",
+   "a": "0915",
+   "b": "1576",
+   "group": "G0036",
+   "explicit": "모양[bottle] round→square"
+  },
+  {
+   "n": 23,
+   "category": "shape",
+   "a": "0748",
+   "b": "1710",
+   "group": "G0376",
+   "explicit": "모양[pitcher] round→square"
+  },
+  {
+   "n": 24,
+   "category": "shape",
+   "a": "0760",
+   "b": "3097",
+   "group": "G0036",
+   "explicit": "모양[bottle] round→square"
+  },
+  {
+   "n": 25,
+   "category": "none",
+   "a": "0773",
+   "b": "2011",
+   "group": "G0452",
+   "explicit": ""
+  },
+  {
+   "n": 26,
+   "category": "none",
+   "a": "2112",
+   "b": "2908",
+   "group": "G0606",
+   "explicit": ""
+  },
+  {
+   "n": 27,
+   "category": "none",
+   "a": "1324",
+   "b": "2443",
+   "group": "G0168",
+   "explicit": ""
+  }
+ ],
+ "probe": {
+  "scope": "그룹 분할 학습 ID 안의 쌍만 (최종 검증 세트는 쓰지 않음)",
+  "single_status_all_pairs": {
+   "해당 없음": 8407,
+   "단일(미확인)": 1671,
+   "단일 확정": 2051
+  },
+  "single_confirmed_in_train_by_category": {
+   "relation_direction": 585,
+   "color": 450,
+   "relation_kind": 180,
+   "pattern": 159,
+   "pose": 105,
+   "material": 61,
+   "state": 24,
+   "shape": 18
+  },
+  "binding_swaps_all": {
+   "색": 3263,
+   "개수": 1196
+  },
+  "binding_swaps_in_train": {
+   "색": 2577,
+   "개수": 978
+  },
+  "phrase_rows_by_category": {
+   "color_binding_swap": 1987,
+   "count_binding_swap": 941,
+   "color": 450,
+   "relation_left_right": 323,
+   "relation_above_below": 255,
+   "pattern": 159,
+   "pose": 105,
+   "material": 61,
+   "state": 24,
+   "shape": 18
+  },
+  "probe_set_by_category": {
+   "color": 6,
+   "count_binding_swap": 6,
+   "state": 6,
+   "relation_left_right": 6,
+   "color_binding_swap": 6
+  },
+  "manual_checks_loaded": 36
+ }
+}
