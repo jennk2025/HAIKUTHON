@@ -159,24 +159,33 @@ def train_itm(rows, train_ids, args, device, neg_pool=None):
                 texts += [by_id[q]["prompt"]] * (1 + len(negs))
                 img_idx += [pos[q]] + [pos[x] for x in negs]
             tok = proc.tokenizer(texts, padding=True, truncation=True, max_length=72, return_tensors="pt").to(device)
-            img = feats[img_idx].to(device)
-            if nv:                                                      # 저장해 둔 앞쪽 층 출력 → 학습하는 마지막 층들
-                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                    h = img.float() if not use_amp else img
-                    for lyr in vm.encoder.layers[-nv:]:
-                        o = lyr(h)
-                        h = o[0] if isinstance(o, tuple) else o
-                    img = vm.post_layernorm(h)
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                att = torch.ones(img.shape[:-1], dtype=torch.long, device=device)
-                h = model.text_encoder(input_ids=tok["input_ids"], attention_mask=tok["attention_mask"],
-                                       encoder_hidden_states=img.to(torch.float16 if use_amp else torch.float32),
-                                       encoder_attention_mask=att).last_hidden_state
-                logit = model.itm_head(h[:, 0, :]).float()
-            match = (logit[:, 1] - logit[:, 0]).view(len(qs), 1 + args.negatives)
-            loss = torch.nn.functional.cross_entropy(match, torch.zeros(len(qs), dtype=torch.long, device=device))
+            per = 1 + args.negatives
+            # 메모리를 아끼려고 질의를 나눠 계산하고 기울기를 모은 뒤 한 번에 갱신 (손실은 질의별 평균이라 한 번에 계산한 것과 같음)
+            micro = int(getattr(args, "micro_queries", 0) or (2 if nv else len(qs)))
             opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
+            loss_sum = 0.0
+            for c in range(0, len(qs), micro):
+                rows_ = slice(c * per, min(c + micro, len(qs)) * per)
+                nq = min(c + micro, len(qs)) - c
+                img = feats[img_idx[rows_]].to(device)
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                    if nv:                                              # 저장해 둔 앞쪽 층 출력 → 학습하는 마지막 층들
+                        h = img.float() if not use_amp else img
+                        for lyr in vm.encoder.layers[-nv:]:
+                            o = lyr(h)
+                            h = o[0] if isinstance(o, tuple) else o
+                        img = vm.post_layernorm(h)
+                    att = torch.ones(img.shape[:-1], dtype=torch.long, device=device)
+                    h = model.text_encoder(input_ids=tok["input_ids"][rows_], attention_mask=tok["attention_mask"][rows_],
+                                           encoder_hidden_states=img.to(torch.float16 if use_amp else torch.float32),
+                                           encoder_attention_mask=att).last_hidden_state
+                    logit = model.itm_head(h[:, 0, :]).float()
+                match = (logit[:, 1] - logit[:, 0]).view(nq, per)
+                part = torch.nn.functional.cross_entropy(match, torch.zeros(nq, dtype=torch.long, device=device),
+                                                         reduction="sum") / len(qs)
+                scaler.scale(part).backward()
+                loss_sum += part.item()
+            loss = torch.tensor(loss_sum)
             scaler.step(opt)
             scaler.update()
             losses.append(loss.item())
