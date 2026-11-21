@@ -396,6 +396,8 @@ def parse_prompt(prompt):
                 continue
             else:                                                        # 도치: "To the right of one X is one Y"
                 after = [k for k in noun_idx if k > objs[-1]]
+                # "Below one X riding one Z, a single Y is red" → 서술어가 붙은 Y가 주어 (Z는 X의 수식어)
+                after = [k for k in after if _is_subject(S, k)] or after
                 if after:
                     subj = after[0]
                 else:
