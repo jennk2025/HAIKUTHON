@@ -287,6 +287,13 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
 
     grid = {(k, lam): score([rank(v3_order(it, k, lam)[0], it) for it in dev_items]) for k in k_list for lam in lam_grid}
     k, lam = max(grid, key=grid.get)
+    k_curve = {}                                                        # BLIP이 다시 보는 후보 수 k별 (λ는 k마다 개발에서)
+    for kk in k_list:
+        lam_k = max(lam_grid, key=lambda l: grid[(kk, l)])
+        rk_k = [rank(v3_order(it, kk, lam_k)[0], it) for it in val_items]
+        k_curve[kk] = {"lam": lam_k, "dev": round(grid[(kk, lam_k)], 4), "val": round(score(rk_k), 4),
+                       "val_R@1": round(sum(r == 1 for r in rk_k) / len(rk_k), 4),
+                       "val_top5": round(sum(r <= 5 for r in rk_k) / len(rk_k), 4)}
     d_o = [v3_order(it, k, lam) for it in dev_items]
     v_o = [v3_order(it, k, lam) for it in val_items]
     top2 = lambda items, g_ids, orders: [(by_id[g_ids[o[j]]]["image_path"], prompts[it["q"]])
@@ -485,6 +492,7 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
             v_oc = swapped(val_items, v_o, v_c, mu)
             res["val_v3+COLOR+OWL"] = met(owl_ranks(val_items, v_oc, owl_prep(val_items, va, v_oc), t, m), "v3+COLOR+OWL")
     res["chosen_on_dev"] = chosen
+    res["k_curve"] = k_curve
     res["per_query"] = per_q
     if save_path:                                                       # 다음 실험이 BLIP을 다시 학습하지 않도록 저장
         pack = lambda items: [{"q": it["q"], "gold": it["gold"], "base_rank": it["base_rank"], "idxB": list(it["idxB"]),
