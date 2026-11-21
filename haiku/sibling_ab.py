@@ -209,6 +209,8 @@ def main():
     ap.add_argument("--trainable", choices=["heads", "last2"], default="heads")
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--smoke", action="store_true", help="작은 점검: 소형 무작위 모델, 학습 64 / 검증 32장, 1에포크")
+    ap.add_argument("--save-dir", type=Path, default=None,
+                    help="첫 seed의 A·B 모델을 저장할 폴더 (재정렬과 합친 조합 평가용, 학습 분할로만 학습한 모델)")
     args = ap.parse_args()
     if args.smoke:
         args.epochs, args.seeds = 1, [0]
@@ -276,6 +278,11 @@ def main():
             results["runs"].append({"seed": seed, "arm": arm, **info, **ev})
             print(f"  [{arm} seed{seed}] 전체 {ev['all']['score']:.4f} / 형제 오답 있는 질의 "
                   f"{(ev['with_sibling'] or {}).get('score', float('nan')):.4f}")
+            if args.save_dir and seed == args.seeds[0] and not args.smoke:
+                out = args.save_dir / f"{arm}_seed{seed}"
+                net.half().save_pretrained(out)
+                processor.save_pretrained(out)
+                print(f"  저장: {out} (그룹 분할 학습 쪽으로만 학습)", flush=True)
             del net
             if device.type == "cuda":
                 torch.cuda.empty_cache()
