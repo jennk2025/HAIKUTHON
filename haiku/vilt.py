@@ -242,7 +242,7 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
               lam_grid=(0.01, 0.02, 0.05, 0.1, 0.2), w_grid=(0.0, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0),
               seed=0, dev_frac=0.15, epochs=3, device="cuda", limit=None,
               owl_chk=None, thr_grid=(0.05, 0.1, 0.15, 0.2, 0.3), margin_grid=(0.03, 0.06, 0.1),
-              color_chk=None, mu_grid=(0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0), save_path=None):
+              color_chk=None, mu_grid=(0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0), save_path=None, gallery="split"):
     """v3와 같은 구조(SigLIP → 조건 재정렬 → 학습한 BLIP)를 공정하게 재현하고, 그 위에 다른 점검을 더하면 좋아지는지 본다.
     - BLIP은 ITM 학습 그룹으로만 학습한다 (개발·검증 그룹은 보지 않음, v3 ①과 같은 분할).
     - vilt: 점수기 하나 또는 {이름: 점수기}. v3 순서의 상위 2장 점수에 w × 점수를 더해 두 장의 순서만 다시 정한다.
@@ -265,6 +265,10 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
     model, proc, info = train_itm(rows, ft, ns, dev_t)
     itm = wrap(model, proc, dev_t)
     ids = dev + va
+    g_dev, g_val = dev, va                      # 후보 이미지: 기본은 같은 분할 안 (질의 수 = 후보 수)
+    if gallery == "all":                        # 테스트에 가깝게: 질의는 그대로, 후보는 학습 데이터 4,000장 전체
+        ids = dev + va + ft
+        g_dev = g_val = ids
     pos = {i: k for k, i in enumerate(ids)}
     prompts = {i: by_id[i]["prompt"] for i in ids}
     img = img_fn([by_id[i]["image_path"] for i in ids])
@@ -274,8 +278,8 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
     bank.add([p for i in ids for p in all_phrases(conds[i])])
     feats = itm.image_embeds([by_id[i]["image_path"] for i in ids])
     k_max = max(k_list)
-    dev_items, _ = prepare(dev, dev, txt, img, pos, conds, bank, lam_cond, K, itm, feats, prompts, k_max)
-    val_items, _ = prepare(va, va, txt, img, pos, conds, bank, lam_cond, K, itm, feats, prompts, k_max)
+    dev_items, _ = prepare(dev, g_dev, txt, img, pos, conds, bank, lam_cond, K, itm, feats, prompts, k_max)
+    val_items, _ = prepare(va, g_val, txt, img, pos, conds, bank, lam_cond, K, itm, feats, prompts, k_max)
     del model, itm, feats
     score = lambda rk: sum(0.5 * ((r == 1) + (1 / math.log2(r + 1) if r <= 5 else 0)) for r in rk) / len(rk)
     rank = lambda order, it: order.index(it["gold"]) + 1 if it["gold"] in order else it["base_rank"]
@@ -326,7 +330,7 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
         return _met(rk)
     for name, sc in scorers.items():
         t0, n0 = time.perf_counter(), getattr(sc, "n", 0)
-        d_v, v_v = sc.score(top2(dev_items, dev, d_o)), sc.score(top2(val_items, va, v_o))
+        d_v, v_v = sc.score(top2(dev_items, g_dev, d_o)), sc.score(top2(val_items, g_val, v_o))
         wg = {w: score(with_w(dev_items, d_o, d_v, w)) for w in w_grid}
         w = max(wg, key=wg.get)
         res[f"val_v3+{name}"] = met(with_w(val_items, v_o, v_v, w), f"v3+{name}")
@@ -362,7 +366,7 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
             return rk
 
         t_owl0, n_owl0 = owl_chk.sec, owl_chk.n_forward
-        d_p, v_p = owl_prep(dev_items, dev, d_o), owl_prep(val_items, va, v_o)
+        d_p, v_p = owl_prep(dev_items, g_dev, d_o), owl_prep(val_items, g_val, v_o)
         og = {(t, m): score(owl_ranks(dev_items, d_o, d_p, t, m)) for t in thr_grid for m in margin_grid}
         t, m = max(og, key=og.get)
         res["val_v3+OWL"] = met(owl_ranks(val_items, v_o, v_p, t, m), "v3+OWL")
@@ -374,7 +378,7 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
         # 확장: 위에 놓임·안·타고 있음·옆까지 상자 규칙으로 확인 (기준값은 개발에서 따로 정함)
         from haiku.owl import EXT_RELS
         n_ext0 = owl_chk.n_forward
-        d_px, v_px = owl_prep(dev_items, dev, d_o, EXT_RELS), owl_prep(val_items, va, v_o, EXT_RELS)
+        d_px, v_px = owl_prep(dev_items, g_dev, d_o, EXT_RELS), owl_prep(val_items, g_val, v_o, EXT_RELS)
         ogx = {(tt, mm): score(owl_ranks(dev_items, d_o, d_px, tt, mm)) for tt in thr_grid for mm in margin_grid}
         tx, mx = max(ogx, key=ogx.get)
         res["val_v3+OWL확장"] = met(owl_ranks(val_items, v_o, v_px, tx, mx), "v3+OWL확장")
@@ -450,7 +454,7 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
 
         d5_o, _ = owl_orders(dev_items, d_o, d_px, tx, mx)
         v5_o, v5_sw = owl_orders(val_items, v_o, v_px, tx, mx)            # v5 = v3 + OWL 확장 (제출한 설정)
-        per_q["top2_v5"] = [[va[o[0]], va[o[1]]] for o, _ in v5_o]
+        per_q["top2_v5"] = [[g_val[o[0]], g_val[o[1]]] for o, _ in v5_o]
         per_q["owl_ext_applicable"] = [p is not None for p in v_px]
         per_q["owl_ext_swapped"] = v5_sw
     if color_chk is not None:
@@ -467,7 +471,7 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
             return v, used, its
 
         o0, n0, c0, s0 = color_chk.owl.sec, color_chk.owl.n_forward, color_chk.n_crops, color_chk.crop_sec
-        (d_c, _, _), (v_c, v_used, v_its) = color_vals(dev_items, dev, d_o), color_vals(val_items, va, v_o)
+        (d_c, _, _), (v_c, v_used, v_its) = color_vals(dev_items, g_dev, d_o), color_vals(val_items, g_val, v_o)
         cg = {mu: score(with_w(dev_items, d_o, d_c, mu)) for mu in mu_grid}
         mu = max(cg, key=cg.get)
         res["val_v3+COLOR"] = met(with_w(val_items, v_o, v_c, mu), "v3+COLOR")
@@ -490,14 +494,15 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
                     out.append((order, sc))
                 return out
             v_oc = swapped(val_items, v_o, v_c, mu)
-            res["val_v3+COLOR+OWL"] = met(owl_ranks(val_items, v_oc, owl_prep(val_items, va, v_oc), t, m), "v3+COLOR+OWL")
+            res["val_v3+COLOR+OWL"] = met(owl_ranks(val_items, v_oc, owl_prep(val_items, g_val, v_oc), t, m), "v3+COLOR+OWL")
     res["chosen_on_dev"] = chosen
     res["k_curve"] = k_curve
     res["per_query"] = per_q
     if save_path:                                                       # 다음 실험이 BLIP을 다시 학습하지 않도록 저장
         pack = lambda items: [{"q": it["q"], "gold": it["gold"], "base_rank": it["base_rank"], "idxB": list(it["idxB"]),
+                               "idxA": list(it["idxA"]),
                                "sB": [float(x) for x in it["sB"]], "itm": [float(x) for x in it["itm"]]} for it in items]
-        save = {"dev": dev, "va": va, "k": k, "lam": lam, "dev_items": pack(dev_items), "val_items": pack(val_items),
+        save = {"dev": dev, "va": va, "g_dev": g_dev, "g_val": g_val, "k_curve": k_curve, "k": k, "lam": lam, "dev_items": pack(dev_items), "val_items": pack(val_items),
                 "v3_orders": {"dev": [(list(o), list(sc)) for o, sc in d_o], "val": [(list(o), list(sc)) for o, sc in v_o]},
                 "chosen": chosen}
         if owl_chk is not None:

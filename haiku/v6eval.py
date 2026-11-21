@@ -27,7 +27,7 @@ def evaluate(rows, saved_path, owl_chk, binder=None, gap_q=(0.25, 0.5, 0.75, 1.0
     by_id = {r["id"]: r for r in rows}
     splits = {}
     for name in ("dev", "val"):
-        g_ids = S["dev"] if name == "dev" else S["va"]
+        g_ids = S.get("g_dev", S["dev"]) if name == "dev" else S.get("g_val", S["va"])
         items = S[f"{name}_items"]
         orders = S["v3_orders"][name]
         splits[name] = {"g": g_ids, "items": items, "orders": [(list(o), list(sc)) for o, sc in orders]}
@@ -163,4 +163,91 @@ def report(res):
                  f"{v['score']:8.4f} {v['fixed']:3d}/{v['broken']:<3d} {v['precision']:5.2f} {v['swap_both_wrong']:5d}{extra}")
     L.append(f"  C 기준(개발에서 선택): {res['C_chosen_on_dev']}")
     L.append(f"  선택 규칙 통과: {res['passed'] or '없음'} → v6 추천: {res['pick']}")
+    return "\n".join(L)
+
+
+def k_breakdown(saved_path, base_k=5, ks=(7, 10)):
+    """저장 결과만으로 (GPU 없이) BLIP 후보 수 k의 효과를 질의 단위로 센다 (OWL 전, v3 단계).
+    - 기준 k에서 'BLIP이 못 본 정답' = 조건 재정렬 후 정답이 k+1위 이하이지만 검색 후보(K장) 안에 있는 질의
+    - 새 k에서 그중 몇 개가 5위 안 / 1위로 돌아왔는지, 기준 k에서 1위였던 질의 중 몇 개를 잃었는지."""
+    S = torch.load(saved_path, weights_only=False)
+    curve = S.get("k_curve", {})
+    items = S["val_items"]
+    rank = lambda o, it: o.index(it["gold"]) + 1 if it["gold"] in o else it["base_rank"]
+
+    def ranks(k):
+        lam = curve.get(k, {}).get("lam", S["lam"])
+        out = []
+        for it in items:
+            sB = torch.tensor(it["sB"][:k]) + lam * torch.tensor(it["itm"][:k])
+            o = [it["idxB"][j] for j in sB.argsort(descending=True).tolist()] + it["idxB"][k:]
+            out.append(rank(o, it))
+        return out
+
+    cond = [it["idxB"].index(it["gold"]) + 1 if it["gold"] in it["idxB"] else it["base_rank"] for it in items]
+    K = len(items[0]["idxB"])
+    base = ranks(base_k)
+    unseen = [n for n, c in enumerate(cond) if base_k < c <= K]
+    L = [f"===== BLIP 후보 수 k 효과 (검증 {len(items)}질의, OWL 전 단계, 기준 k={base_k}) =====",
+         f"  검색 후보 {K}장 밖에 정답: {sum(c > K for c in cond)} | 조건 재정렬 후 {base_k + 1}~{K}위라 BLIP이 못 본 정답: {len(unseen)} "
+         f"(6~7위 {sum(c <= 7 for c in (cond[n] for n in unseen))}, 8~{K}위 {sum(c > 7 for c in (cond[n] for n in unseen))})",
+         f"  k={base_k}: 점수 {_score(base):.4f}  1위 {sum(r == 1 for r in base)}  5위 안 {sum(r <= 5 for r in base)}"]
+    for k in ks:
+        if k > len(items[0]["itm"]):
+            continue
+        rk = ranks(k)
+        rec5 = sum(rk[n] <= 5 for n in unseen)
+        rec1 = sum(rk[n] == 1 for n in unseen)
+        lost = sum(b == 1 and r > 1 for b, r in zip(base, rk))
+        gain = sum(b > 1 and r == 1 for b, r in zip(base, rk))
+        L.append(f"  k={k:2d}: 점수 {_score(rk):.4f}  1위 {sum(r == 1 for r in rk)}  5위 안 {sum(r <= 5 for r in rk)} | "
+                 f"못 보던 {len(unseen)}개 중 5위 안 복구 {rec5}, 1위 복구 {rec1} | 1위 새로 맞힘 {gain}, 기존 1위 잃음 {lost}")
+    return "\n".join(L)
+
+
+def mix_breakdown(saved_path, base_k=5):
+    """BLIP에 넘길 후보를 '조건 재정렬 상위 + 아직 안 들어간 SigLIP 상위'로 섞는 방식 비교 (저장 결과만, GPU 없음).
+      A: 조건 상위 5 | B: 조건 상위 4 + SigLIP 1 (BLIP 호출 수 같음) | C: 조건 상위 5 + SigLIP 2 (7장)
+      D: 조건 상위 7 | E: 조건 상위 10
+    BLIP 점수가 있는 후보(조건 순위 상위 k_max) 안에서만 섞는다. 나머지 순서는 조건 재정렬 순서를 따른다."""
+    S = torch.load(saved_path, weights_only=False)
+    items = S["val_items"]
+    if "idxA" not in items[0]:
+        return "(이 저장 파일에는 SigLIP 순서가 없어 혼합 비교를 할 수 없습니다 — 새 코드로 다시 저장 필요)"
+    curve = S.get("k_curve", {})
+    lam_of = lambda n: curve.get(n, curve.get(min(curve, key=lambda k: abs(k - n)), {})).get("lam", S["lam"]) if curve else S["lam"]
+    rank = lambda o, it: o.index(it["gold"]) + 1 if it["gold"] in o else it["base_rank"]
+    kmax = len(items[0]["itm"])
+
+    def order_for(it, n_cond, n_sig):
+        sel = list(it["idxB"][:n_cond])
+        for j in it["idxA"]:
+            if len([x for x in sel if x not in it["idxB"][:n_cond]]) >= n_sig:
+                break
+            if j not in sel and j in it["idxB"][:kmax]:
+                sel.append(j)
+        pos = {j: p for p, j in enumerate(it["idxB"])}
+        lam = lam_of(len(sel))
+        sc = {j: it["sB"][pos[j]] + lam * it["itm"][pos[j]] for j in sel}
+        head = sorted(sel, key=lambda j: -sc[j])
+        return head + [j for j in it["idxB"] if j not in sel]
+
+    plans = {"A 조건 5": (5, 0), "B 조건 4 + SigLIP 1": (4, 1), "C 조건 5 + SigLIP 2": (5, 2), "D 조건 7": (7, 0), "E 조건 10": (10, 0)}
+    cond = [it["idxB"].index(it["gold"]) + 1 if it["gold"] in it["idxB"] else it["base_rank"] for it in items]
+    K = len(items[0]["idxB"])
+    unseen = [n for n, c in enumerate(cond) if base_k < c <= K]
+    sig5 = sum(items[n]["base_rank"] <= 5 for n in unseen)
+    L = [f"===== BLIP 후보 혼합 비교 (검증 {len(items)}질의, OWL 전 단계) =====",
+         f"  조건 재정렬 후 BLIP 밖(6~{K}위)으로 밀린 정답 {len(unseen)}개 중 SigLIP 순위로는 5위 안이었던 것: {sig5}개"]
+    base = [rank(order_for(it, 5, 0), it) for it in items]
+    for name, (nc, ns) in plans.items():
+        if nc > kmax:
+            continue
+        rk = [rank(order_for(it, nc, ns), it) for it in items]
+        rec5 = sum(rk[n] <= 5 for n in unseen)
+        rec1 = sum(rk[n] == 1 for n in unseen)
+        lost = sum(b == 1 and r > 1 for b, r in zip(base, rk))
+        gain = sum(b > 1 and r == 1 for b, r in zip(base, rk))
+        L.append(f"  {name:20s} BLIP {nc + ns:2d}장 | 점수 {_score(rk):.4f}  1위 {sum(r == 1 for r in rk)}  5위 안 {sum(r <= 5 for r in rk)} | "
+                 f"밀린 {len(unseen)}개 중 5위 안 {rec5}·1위 {rec1} | A 대비 1위 새로 {gain}, 잃음 {lost}")
     return "\n".join(L)
