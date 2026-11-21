@@ -1,0 +1,12 @@
+# 대회 데이터와 스타터 키트 (용량이 커서 git에 올리지 않음)
+haikuthon-train/
+_starterkit/
+*.zip
+*.safetensors
+*.bin
+*.pt
+
+# Python
+__pycache__/
+.venv/
+.ipynb_checkpoints/
