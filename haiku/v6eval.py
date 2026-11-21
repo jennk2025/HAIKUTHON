@@ -266,7 +266,7 @@ def plural_eval(rows, saved_path, owl_chk, conf_grid=(0.05, 0.1, 0.15, 0.2), mar
         g = S.get("g_dev", S["dev"]) if name == "dev" else S.get("g_val", S["va"])
         items, orders = S[f"{name}_items"], [(list(o), list(sc)) for o, sc in S["v3_orders"][name]]
         prompt = lambda it: by_id[it["q"]]["prompt"]
-        path = lambda j: by_id[g[j]]["image_path"]
+        path = (lambda gg: (lambda j: by_id[gg[j]]["image_path"]))(g)     # 분할마다 갤러리를 고정 (늦은 바인딩 방지)
         # v4 순서 (OWL 좌우·상하, 0.1/0.06)
         prep, need = [], []
         for it, (o, _) in zip(items, orders):
