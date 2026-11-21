@@ -10,3 +10,6 @@ _starterkit/
 __pycache__/
 .venv/
 .ipynb_checkpoints/
+
+# 점검 산출물 중 재생성 가능한 큰 파일
+reports/image_index.csv

@@ -260,7 +260,36 @@ predict(model, queries, candidates, top_k=5) -> dict
 
 ---
 
-## 9. 작업 환경 (Colab / Kaggle)
+## 9. 데이터 점검과 검증 분할
+
+| 결과물 | 내용 |
+|---|---|
+| [`reports/data_audit.md`](reports/data_audit.md) | 자동 점검 보고서 (ID 대응, 손상, 형식·크기, 완전 중복, 근접 중복 후보, 텍스트 유사도, 문제 목록) |
+| [`reports/manual_review.md`](reports/manual_review.md) | 근접 중복 후보 육안 확인 기록 |
+| [`reports/split_report.md`](reports/split_report.md) | 분할 결과와 학습·검증에 걸친 유사 쌍 |
+| [`splits/split_seed42.json`](splits/split_seed42.json) | 학습 3,200 / 검증 800 ID 목록과 메타데이터 (`train_ids.txt`, `valid_ids.txt`도 있음) |
+
+**요약 (2026-11-21 측정)**
+- 오류 0건. ID `0000`~`3999`가 이미지 4,000장과 1:1로 맞고, 누락·손상·중복 ID·빈 설명이 없다. 이미지는 모두 768×768 RGB PNG다.
+- 완전 중복(파일, 픽셀, 텍스트)이 없다. 그래서 분할은 **스타터 키트 공식 분할(seed 42)과 같다.** 공식 검증 점수와 바로 비교할 수 있다.
+- 참고: 22개 설명에 문단 줄바꿈(`\n\n`)이 있고, 1개 설명에 `’` 문자가 있다. 원본은 그대로 둔다.
+- 근접 중복 후보 115쌍 중 상위 12쌍을 육안으로 확인했다. 모두 중복이 아니라 **속성 하나만 다른 대조 이미지**였다. 텍스트에도 색 결합이나 관계 방향만 바뀐 쌍이 있다.
+- 임베딩 기반 의미 유사도는 검사하지 않았다.
+
+**실행 방법**
+
+```bash
+python -m haiku.audit --data-dir haikuthon-train --out-dir reports
+python -m haiku.split --data-dir haikuthon-train --audit reports/data_audit.json --out-dir splits
+```
+
+Colab에서는 `notebooks/02_data_audit_split.ipynb`를 CPU 런타임으로 실행한다. 필요한 패키지는 numpy와 pillow뿐이다.
+
+**분할 사용 규칙**: 실험에서는 `haiku.data.load_split`으로 분할을 읽는다. 검증 ID는 학습, 증강 데이터 생성, hard negative 채굴에 쓰지 않는다. 학습·증강 코드에서는 `haiku.data.assert_not_valid`로 확인한다.
+
+---
+
+## 10. 작업 환경 (Colab / Kaggle)
 
 학습은 무료 Colab / Kaggle GPU에서만 한다(공식 규정). 노트북을 열고 위에서부터 실행하면 저장소 코드, Train 데이터, 스타터 키트가 한 번에 준비된다.
 
@@ -268,6 +297,9 @@ predict(model, queries, candidates, top_k=5) -> dict
 |---|---|---|
 | `notebooks/00_colab_setup.ipynb` | 환경 준비, 데이터 확인, 자유 작업 공간 | [Colab](https://colab.research.google.com/github/jennk2025/HAIKUTHON/blob/main/notebooks/00_colab_setup.ipynb) |
 | `notebooks/01_baseline_repro.ipynb` | 공식 baseline 재현과 기본 측정 (exp000) | [Colab](https://colab.research.google.com/github/jennk2025/HAIKUTHON/blob/main/notebooks/01_baseline_repro.ipynb) |
+| `notebooks/02_data_audit_split.ipynb` | 데이터 점검과 검증 분할 (CPU 런타임) | [Colab](https://colab.research.google.com/github/jennk2025/HAIKUTHON/blob/main/notebooks/02_data_audit_split.ipynb) |
+
+**Colab 세션 한도**: 무료 Colab은 동시에 열 수 있는 런타임 수에 한도가 있다. "세션이 너무 많다"는 경고가 나오면 런타임 > 세션 관리에서 쓰지 않는 노트북의 세션을 종료한다. 데이터는 Drive에 캐시되어 있으므로 종료해도 다시 받지 않는다. GPU가 필요 없는 작업(02)은 CPU 런타임으로 돌린다.
 
 **데이터 보관 (Colab)**
 - 처음 실행할 때 Hugging Face에서 받아 `/content/work`에 두고, Drive `MyDrive/HAIKUTHON/haikuthon-train.tar`(약 5GB)로 저장한다.
@@ -280,11 +312,15 @@ predict(model, queries, candidates, top_k=5) -> dict
 ```
 haiku/                  공용 코드
   setup_data.py         환경 감지, 데이터·스타터 키트 준비, Drive 캐시
-  data.py               데이터 읽기, 공식 분할(시드 42, 3,200 / 800), predict() 입력 형식
+  audit.py              데이터 점검 (python -m haiku.audit)
+  split.py              검증 분할 생성 (python -m haiku.split)
+  data.py               데이터 읽기, 분할 읽기(load_split), 검증 ID 누수 검사, predict() 입력 형식
   metrics.py            공식 점수, Hit@K, 순위 분포, predict() 결과 검사
   retrieval.py          SigLIP 임베딩, 전체 순위 계산
   timing.py             시간·VRAM 측정, Test 규모 입력, 결과 저장
 notebooks/              Colab / Kaggle 노트북
+reports/                데이터 점검·분할 보고서
+splits/                 검증 분할 ID 목록
 requirements-colab.txt  작업용 패키지 (채점 서버 버전에 맞춤)
 ```
 
