@@ -44,7 +44,82 @@ def _label(prompt_gold, prompt_wrong):
     return lab, fmt_diffs(diffs, "explicit")
 
 
-def export(rows, saved_path, owl_chk, out_zip, n_compare=10, img_size=512, seed=0):
+def k_compare(rows, saved_path, owl_chk, old_k=5, new_k=10):
+    """BLIP 후보 k=5(v4) vs k=10(v6) 질의별 비교 (저장 결과 재사용, 둘 다 v4 OWL 교환 적용).
+    최종 1위가 바뀐 질의를 '복구 / 밀어냄 / 둘 다 오답' × '새 1위가 기존 BLIP 창(5장) 밖에서 왔는지'로 나눈다."""
+    S = torch.load(saved_path, weights_only=False)
+    by_id = {r["id"]: r for r in rows}
+    g = S.get("g_val", S["va"])
+    items = S["val_items"]
+    curve = S.get("k_curve") or {}
+    new_k = min(new_k, len(items[0]["itm"]))                            # BLIP 점수가 저장된 후보 수까지만
+    path = lambda j: by_id[g[j]]["image_path"]
+
+    def orders(k):
+        lam = curve.get(k, {}).get("lam", S["lam"])
+        out = []
+        for it in items:
+            sc = torch.tensor(it["sB"][:k]) + lam * torch.tensor(it["itm"][:k])
+            out.append([it["idxB"][j] for j in sc.argsort(descending=True).tolist()] + list(it["idxB"][k:]))
+        need, prep = [], []
+        for it, o in zip(items, out):
+            rels = spatial_relations(by_id[it["q"]]["prompt"], BASE_RELS)
+            if rels and len(o) >= 2:
+                names = tuple(sorted({x for _, a, b in rels for x in (a, b)}))
+                need += [(path(o[0]), names), (path(o[1]), names)]
+                prep.append((rels, names))
+            else:
+                prep.append(None)
+        owl_chk.detect(need)
+        for n, (o, pr) in enumerate(zip(out, prep)):
+            if pr and should_swap(owl_chk.cache[(path(o[0]), pr[1])], owl_chk.cache[(path(o[1]), pr[1])], pr[0], 0.1, 0.06):
+                out[n] = [o[1], o[0]] + o[2:]
+        return out, lam
+
+    o_old, lam_old = orders(old_k)
+    o_new, lam_new = orders(new_k)
+    recs, counts = [], {}
+    for n, it in enumerate(items):
+        a, b = o_old[n], o_new[n]
+        gold = it["gold"]
+        rk = lambda o: o.index(gold) + 1 if gold in o else it["base_rank"]
+        cond = {j: r + 1 for r, j in enumerate(it["idxB"])}
+        outside = cond.get(b[0], 99) > old_k
+        if a[0] == b[0]:
+            cat = "1위 같음"
+        elif b[0] == gold:
+            cat = "복구: 새 1위가 정답"
+        elif a[0] == gold:
+            cat = "밀어냄: 기존 정답 1위를 잃음"
+        else:
+            cat = "둘 다 오답"
+        if a[0] != b[0]:
+            cat += " (새 1위가 기존 5장 밖)" if outside else " (기존 5장 안 순서 변화)"
+        counts[cat] = counts.get(cat, 0) + 1
+        lab, det_ = "", ""
+        if cat.startswith("밀어냄"):
+            lab, det_ = _label(by_id[g[gold]]["prompt"], by_id[g[b[0]]]["prompt"])
+        elif cat.startswith(("복구", "둘 다")):
+            lab, det_ = _label(by_id[g[gold]]["prompt"], by_id[g[(a if cat.startswith("복구") else b)[0]]]["prompt"])
+        recs.append({"query_id": it["q"], "prompt": by_id[it["q"]]["prompt"], "gold_id": g[gold],
+                     "cond_rank_gold": cond.get(gold, it["base_rank"]),
+                     f"k{old_k}_top1_id": g[a[0]], f"k{old_k}_top2_id": g[a[1]], f"k{old_k}_rank_gold": rk(a),
+                     f"k{new_k}_top1_id": g[b[0]], f"k{new_k}_top2_id": g[b[1]], f"k{new_k}_rank_gold": rk(b),
+                     f"k{new_k}_top1_cond_rank": cond.get(b[0], ""), "category": cat, "diff_label": lab, "diff_detail": det_,
+                     "images": ""})
+    for r in recs:
+        if r["category"] != "1위 같음":
+            ids = list(dict.fromkeys([r["gold_id"], r[f"k{old_k}_top1_id"], r[f"k{new_k}_top1_id"]]))
+            r["images"] = ";".join(f"images/{i}.jpg" for i in ids)
+    types = {}
+    for r in recs:
+        if r["category"].startswith("밀어냄"):
+            types[r["diff_label"]] = types.get(r["diff_label"], 0) + 1
+    return {"recs": recs, "counts": counts, "lost_types": types, "lam": (lam_old, lam_new), "file": Path(saved_path).name,
+            "n_gallery": len(g)}
+
+
+def export(rows, saved_path, owl_chk, out_zip, n_compare=10, img_size=512, seed=0, k_saved=None):
     S = torch.load(saved_path, weights_only=False)
     by_id = {r["id"]: r for r in rows}
     g = S.get("g_val", S["va"])
@@ -130,6 +205,11 @@ def export(rows, saved_path, owl_chk, out_zip, n_compare=10, img_size=512, seed=
     out_zip = Path(out_zip)
     out_zip.parent.mkdir(parents=True, exist_ok=True)
     img_ids = set()
+    K = k_compare(rows, k_saved, owl_chk) if k_saved else None
+    if K:
+        for r in K["recs"]:
+            if r["images"]:
+                img_ids.update(x[len("images/"):-len(".jpg")] for x in r["images"].split(";"))
     for r in recs:
         if r["case_group"]:
             ids = [r["final_top1_id"], r["final_top2_id"]]
@@ -141,6 +221,12 @@ def export(rows, saved_path, owl_chk, out_zip, n_compare=10, img_size=512, seed=
         w.writeheader()
         w.writerows(recs)
         z.writestr("cases.csv", "﻿" + buf.getvalue())
+        if K:
+            buf = io.StringIO()
+            w = csv.DictWriter(buf, fieldnames=list(K["recs"][0]))
+            w.writeheader()
+            w.writerows(K["recs"])
+            z.writestr("k5_vs_k10.csv", "﻿" + buf.getvalue())
         for i in sorted(img_ids):
             with Image.open(by_id[i]["image_path"]) as im:
                 im = im.convert("RGB")
@@ -158,8 +244,15 @@ def export(rows, saved_path, owl_chk, out_zip, n_compare=10, img_size=512, seed=
                   "owl_det_v4_* = BLIP 직후 1·2위(v4 교환 판단에 쓴 두 장), owl_det_final_* = 최종 1·2위",
                   "- multi_instance_parsed: 같은 종류 물체가 여러 개이고 개체마다 속성이 다른 문장의 개체 분해 (개체 구별 실험의 파서)",
                   "- plural_relation: '두 X가 한 Y 위/아래/왼쪽/오른쪽' 문장의 분해 (복수 관계 점검 파서)",
+                  *([f"- k5_vs_k10.csv: BLIP 후보 5장(v4) vs 10장(v6), 둘 다 v4 OWL 교환 적용, 원본 {K['file']} (후보 {K['n_gallery']}장, "
+                     f"λ {K['lam'][0]} / {K['lam'][1]}). 1위가 바뀐 질의는 정답·기존 1위·새 1위 이미지 포함",
+                     "  - 분류 (개수): " + ", ".join(f"{k} {v}" for k, v in sorted(K["counts"].items(), key=lambda x: -x[1])),
+                     "  - 밀어냄 사례의 차이 유형: " + (", ".join(f"{k} {v}" for k, v in sorted(K["lost_types"].items(), key=lambda x: -x[1])) or "없음")]
+                    if K else []),
                   "- 저장돼 있지 않아 포함하지 못한 항목:"] + [f"  - {m}" for m in FIELDS_MISSING]
         z.writestr("README.md", "\n".join(readme) + "\n")
     return {"zip": str(out_zip), "rows": len(recs), "rank2": sum(r["case_group"] == "최종 2위" for r in recs),
             "compare": sum(r["case_group"].startswith("비교") for r in recs), "images": len(img_ids),
-            "labels": labels, "missing": FIELDS_MISSING}
+            "labels": labels, "missing": FIELDS_MISSING,
+            "k_counts": K["counts"] if K else None, "k_lost_types": K["lost_types"] if K else None,
+            "k_file": K["file"] if K else None}
