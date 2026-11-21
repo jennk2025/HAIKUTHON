@@ -141,3 +141,85 @@ def probe_vilt(vilt, rows, train_ids, pairs_csv, contrast_csv, per_cat=100):
     orig, phr = load_probe_pairs(pairs_csv, contrast_csv, train_ids, per_cat)
     fn = lambda texts, ids: torch.tensor(vilt.score([(by_id[i]["image_path"], t) for t, i in zip(texts, ids)]))
     return probe_2x2(orig, fn), probe_2x2(phr, fn)
+
+
+def run_vs_v3(rows, split, img_fn, txt_fn, vilt, lam_cond=3.2, K=10, k_list=(3, 5),
+              lam_grid=(0.01, 0.02, 0.05, 0.1, 0.2), w_grid=(0.0, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 1.0),
+              seed=0, dev_frac=0.15, epochs=3, device="cuda", limit=None):
+    """v3와 같은 구조(SigLIP → 조건 재정렬 → 학습한 BLIP)를 공정하게 재현하고, 그 위에 ViLT를 더하면 좋아지는지 본다.
+    - BLIP은 ITM 학습 그룹으로만 학습한다 (개발·검증 그룹은 보지 않음, [3/3]·v3 ①과 같은 분할).
+    - v3의 k·λ와 ViLT 비중 w는 개발 그룹에서 정하고, 검증 800질의에서 한 번만 보고한다 (w=0이면 ViLT를 안 쓰는 것과 같음).
+    - ViLT는 v3 순서의 상위 2장만 다시 본다."""
+    import argparse
+    import random
+
+    from haiku.combo import prepare
+    from haiku.itm import BLIP_ID
+    from haiku.itm_finetune import train_itm, wrap
+    from haiku.rerank import PhraseBank, all_phrases, extract_conditions
+    from haiku.siblings import build_groups, parse_prompt
+    dev_t = torch.device(device)
+    by_id = {r["id"]: r for r in rows}
+    group_of, _ = build_groups(rows, {r["id"]: parse_prompt(r["prompt"]) for r in rows})
+    tr, va = list(split["train_ids"]), list(split["valid_ids"])
+    groups = sorted({group_of[i] for i in tr})
+    random.Random(seed).shuffle(groups)
+    dev_groups = set(groups[:max(1, int(len(groups) * dev_frac))])
+    dev = [i for i in tr if group_of[i] in dev_groups]
+    ft = [i for i in tr if group_of[i] not in dev_groups]
+    if limit:
+        ft, dev, va = ft[:limit[0]], dev[:limit[1]], va[:limit[2]]
+    ns = argparse.Namespace(blip=BLIP_ID, seed=seed, lr=2e-5, epochs=epochs, queries_per_step=8, negatives=7)
+    model, proc, info = train_itm(rows, ft, ns, dev_t)
+    itm = wrap(model, proc, dev_t)
+    ids = dev + va
+    pos = {i: k for k, i in enumerate(ids)}
+    prompts = {i: by_id[i]["prompt"] for i in ids}
+    img = img_fn([by_id[i]["image_path"] for i in ids])
+    txt = txt_fn([prompts[i] for i in ids])
+    conds = {i: extract_conditions(prompts[i]) for i in ids}
+    bank = PhraseBank(txt_fn)
+    bank.add([p for i in ids for p in all_phrases(conds[i])])
+    feats = itm.image_embeds([by_id[i]["image_path"] for i in ids])
+    k_max = max(k_list)
+    dev_items, _ = prepare(dev, dev, txt, img, pos, conds, bank, lam_cond, K, itm, feats, prompts, k_max)
+    val_items, _ = prepare(va, va, txt, img, pos, conds, bank, lam_cond, K, itm, feats, prompts, k_max)
+    score = lambda rk: sum(0.5 * ((r == 1) + (1 / math.log2(r + 1) if r <= 5 else 0)) for r in rk) / len(rk)
+    rank = lambda order, it: order.index(it["gold"]) + 1 if it["gold"] in order else it["base_rank"]
+
+    def v3_order(it, k, lam):
+        head = it["sB"][:k] + lam * it["itm"][:k]
+        o = head.argsort(descending=True).tolist()
+        return [it["idxB"][j] for j in o] + it["idxB"][k:], head[o].tolist()
+
+    grid = {(k, lam): score([rank(v3_order(it, k, lam)[0], it) for it in dev_items]) for k in k_list for lam in lam_grid}
+    k, lam = max(grid, key=grid.get)
+
+    def vilt_scores(items, g_ids):
+        orders = [v3_order(it, k, lam) for it in items]
+        pairs = [(by_id[g_ids[o[j]]]["image_path"], prompts[it["q"]]) for it, (o, _) in zip(items, orders) for j in (0, 1)]
+        return orders, vilt.score(pairs)
+
+    def with_w(items, orders, v, w):
+        rk = []
+        for n, (it, (order, sc)) in enumerate(zip(items, orders)):
+            if sc[1] + w * v[2 * n + 1] > sc[0] + w * v[2 * n]:
+                order = [order[1], order[0]] + order[2:]
+            rk.append(rank(order, it))
+        return rk
+
+    d_o, d_v = vilt_scores(dev_items, dev)
+    v_o, v_v = vilt_scores(val_items, va)
+    wgrid = {w: score(with_w(dev_items, d_o, d_v, w)) for w in w_grid}
+    w = max(wgrid, key=wgrid.get)
+    search = [it["base_rank"] for it in val_items]
+    v3 = with_w(val_items, v_o, v_v, 0.0)
+    v3v = with_w(val_items, v_o, v_v, w)
+    met = lambda rk, ref: {"score": round(score(rk), 4), "recall@1": round(sum(r == 1 for r in rk) / len(rk), 4),
+                           "fixed_vs_v3": sum(b > 1 and r == 1 for b, r in zip(ref, rk)),
+                           "broken_vs_v3": sum(b == 1 and r > 1 for b, r in zip(ref, rk))}
+    return {"sizes": {"itm_train": len(ft), "dev": len(dev), "val": len(va)}, "train": info,
+            "chosen_on_dev": {"k": k, "lam_itm": lam, "w_vilt": w, "dev_v3": round(grid[(k, lam)], 4),
+                              "dev_v3+vilt": round(wgrid[w], 4)},
+            "val_search_only": met(search, v3), "val_v3": met(v3, v3), "val_v3+ViLT": met(v3v, v3),
+            "val_v3_gold_exactly_2nd": sum(r == 2 for r in v3)}

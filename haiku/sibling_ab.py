@@ -211,6 +211,9 @@ def main():
     ap.add_argument("--smoke", action="store_true", help="작은 점검: 소형 무작위 모델, 학습 64 / 검증 32장, 1에포크")
     ap.add_argument("--save-dir", type=Path, default=None,
                     help="첫 seed의 A·B 모델을 저장할 폴더 (재정렬과 합친 조합 평가용, 학습 분할로만 학습한 모델)")
+    ap.add_argument("--final", action="store_true",
+                    help="제출용: 4,000쌍 전체를 --final-arm 방식으로 학습해 out-dir/siglip_<arm>_final 에 저장 (평가 없음)")
+    ap.add_argument("--final-arm", choices=["A", "B"], default="B")
     args = ap.parse_args()
     if args.smoke:
         args.epochs, args.seeds = 1, [0]
@@ -224,6 +227,24 @@ def main():
     split = json.loads(args.split.read_text(encoding="utf-8"))
     train_ids, valid_ids = split["train_ids"], split["valid_ids"]
     parsed, group_of, pairs = prepare_pairs(rows)
+    if args.final:
+        # 제출용 최종 학습: 4,000쌍 전체, 형제 비교 쌍도 전체에서 고른다 (검증 없음)
+        all_ids = [r["id"] for r in rows]
+        pair_index = {(p["a"], p["b"]): p for p in pairs}
+        clear_all = [(p["a"], p["b"]) for p in pairs if p["clear"]]
+        index_of = {r["id"]: k for k, r in enumerate(rows)}
+        cache = args.cache_dir / f"inputs_{args.base_model.split('/')[-1]}_{len(rows)}.pt" if args.cache_dir else None
+        pixels, input_ids = cache_inputs(rows, processor, cache, args.workers)
+        print(f"최종 학습: {len(all_ids)}쌍, 방식 {args.final_arm}, 학습 대상 {args.trainable}, 에포크 {args.epochs}", flush=True)
+        net, info = train_arm(args.final_arm, args, args.seeds[0], pixels, input_ids, index_of, all_ids, clear_all,
+                              group_of, pair_index, device)
+        out = args.out_dir / f"siglip_{args.final_arm}_final"
+        out.mkdir(parents=True, exist_ok=True)
+        net.half().save_pretrained(out)
+        processor.save_pretrained(out)
+        (out / "train_info.json").write_text(json.dumps(info, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+        print("저장:", out, flush=True)
+        return
     if args.smoke:
         rng = random.Random(0)
         tg = sorted({group_of[i] for i in train_ids})
