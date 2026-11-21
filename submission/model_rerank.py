@@ -58,7 +58,8 @@ def load_model(model_dir, device):
         model["blip"] = blip
         model["blip_proc"] = AutoProcessor.from_pretrained(root / "blip", local_files_only=True)
     model["owl"] = None
-    if ((cfg.get("owl") or {}).get("use") or (cfg.get("color") or {}).get("use")) and (root / "owl").exists():
+    if ((cfg.get("owl") or {}).get("use") or (cfg.get("color") or {}).get("use") or (cfg.get("plural") or {}).get("use")) \
+            and (root / "owl").exists():
         from transformers import OwlViTForObjectDetection, OwlViTProcessor
         model["owl"] = OwlViTForObjectDetection.from_pretrained(root / "owl", local_files_only=True, dtype=dtype).to(device).eval()
         model["owl_proc"] = OwlViTProcessor.from_pretrained(root / "owl", local_files_only=True)
@@ -336,6 +337,82 @@ def owl_rerank(model, queries, paths, orders, scores, ocfg, ccfg, t0, t_img_per)
 
 
 @torch.inference_mode()
+def owl_detect_multi(model, paths, need, max_boxes=4, thr=0.03, iou=0.5):
+    """need: {후보 번호: {문구}} → {(후보 번호, 문구): [(점수, cx, cy, w, h), ...]} (점수 순, 겹치는 상자 제거, 최대 max_boxes).
+    haiku.owl.OwlChecker.detect_multi와 같은 계산 (같은 종류 물체 여러 개를 찾기 위함)."""
+    from haiku.owl import _iou
+    owl, proc, dev = model["owl"], model["owl_proc"], model["device"]
+    names = sorted({n for v in need.values() for n in v})
+    row = {n: k for k, n in enumerate(names)}
+    tok = proc.tokenizer([f"a photo of a {n}" for n in names] + [" "], padding="max_length", truncation=True,
+                         return_tensors="pt").to(dev)
+    pad_row = len(names)
+    js = sorted(need)
+    dl = torch.utils.data.DataLoader(_Images([paths[j] for j in js], proc.image_processor), batch_size=OWL_BATCH,
+                                     num_workers=WORKERS, pin_memory=dev.type == "cuda")
+    out, s = {}, 0
+    for px in dl:
+        chunk = js[s:s + len(px)]
+        s += len(px)
+        lists = [sorted(need[j]) for j in chunk]
+        width = max(len(l) for l in lists)
+        ridx = torch.tensor([[row[n] for n in l] + [pad_row] * (width - len(l)) for l in lists], device=dev).view(-1)
+        o = owl(input_ids=tok["input_ids"][ridx], attention_mask=tok["attention_mask"][ridx],
+                pixel_values=px.to(dev, dtype=next(owl.parameters()).dtype, non_blocking=True))
+        probs, boxes = o.logits.float().sigmoid(), o.pred_boxes.float()
+        for b, (j, l) in enumerate(zip(chunk, lists)):
+            for q, n in enumerate(l):
+                sc, order = probs[b, :, q].sort(descending=True)
+                kept = []
+                for v, i in zip(sc[:100].tolist(), order[:100].tolist()):
+                    if v < thr:
+                        break
+                    bx = boxes[b, i].tolist()
+                    if all(_iou(bx, k[1:]) < iou for k in kept):
+                        kept.append((v, *bx))
+                        if len(kept) >= max_boxes:
+                            break
+                out[(j, n)] = kept
+    return out
+
+
+def plural_rerank(model, queries, paths, orders, pcfg, t0):
+    """'두 X가 한 Y의 위/아래/왼쪽/오른쪽' 질의: 최종 상위 2장에서 X 두 개와 Y 한 개를 찾아 두 X 모두 방향을 지키는지 본다.
+    1위가 어기고(contradict) 2위가 지킬 때(satisfy)만 교환. 시간 안전장치는 경과 시간만 (모든 질의 동일)."""
+    from haiku.plural import owl_found, parse_plural_plan, plural_geometry
+    elapsed = time.perf_counter() - t0
+    info = {"plural_used": False, "plural_start_sec": round(elapsed, 1)}
+    if elapsed > float(pcfg.get("skip_after_sec", 800)):
+        return info
+    plans = {}
+    for n, q in enumerate(queries):
+        p = parse_plural_plan(q["prompt"])
+        if p["eligible"] and len(orders[n]) >= 2:
+            plans[n] = p["relations"][0]
+    need = {}
+    for n, p in plans.items():
+        for j in orders[n][:2]:
+            need.setdefault(j, set()).update((p["subject"], p["object"]))
+    info["plural_queries"] = len(plans)
+    if not plans:
+        return info
+    det = owl_detect_multi(model, paths, need)
+    conf, margin = float(pcfg.get("min_conf", 0.2)), float(pcfg.get("margin", 0.08))
+    swapped = 0
+    for n, p in plans.items():
+        a, b = orders[n][:2]
+        v = []
+        for j in (a, b):
+            found = {p["subject"]: owl_found(det.get((j, p["subject"]), [])), p["object"]: owl_found(det.get((j, p["object"]), []))}
+            v.append(plural_geometry(found, p["subject"], p["relation"], p["object"], margin=margin, min_conf=conf)["verdict"])
+        if v == ["contradict", "satisfy"]:
+            orders[n] = [b, a] + orders[n][2:]
+            swapped += 1
+    info.update(plural_used=True, plural_swapped=swapped, plural_sec=round(time.perf_counter() - t0 - elapsed, 1))
+    return info
+
+
+@torch.inference_mode()
 def predict(model, queries, candidates, top_k=5):
     t0 = time.perf_counter()
     cfg = model["cfg"]
@@ -403,6 +480,9 @@ def predict(model, queries, candidates, top_k=5):
     if model.get("owl") is not None and (ocfg.get("use") or ccfg.get("use")):
         scores = [heads[n].float().tolist() for n in range(len(queries))]
         timing.update(owl_rerank(model, queries, paths, orders, scores, ocfg, ccfg, t0, t_img / max(len(paths), 1)))
+    pcfg = cfg.get("plural") or {}
+    if model.get("owl") is not None and pcfg.get("use"):
+        timing.update(plural_rerank(model, queries, paths, orders, pcfg, t0))
     timing["total_sec"] = round(time.perf_counter() - t0, 1)
     model["last_timing"] = timing
     return {q["prompt_id"]: [image_ids[j] for j in orders[n][:top_k]] for n, q in enumerate(queries)}
