@@ -356,6 +356,10 @@ def predict(model, queries, candidates, top_k=5):
     use_rerank = method != "A" and lam > 0 and elapsed < float(cfg.get("skip_rerank_after_sec", 700))
     use_itm = raw is not None and icfg.get("use") and elapsed < float(icfg.get("skip_after_sec", 600))
     k_itm, lam_itm, tau_itm = int(icfg.get("k", 2)), float(icfg.get("lam", 0.0)), icfg.get("tau")
+    if use_itm and icfg.get("k_by_elapsed"):
+        # BLIP이 다시 볼 후보 수를 경과 시간만으로 한 번 정한다 (모든 질의에 동일): 예) [[280, 10], [380, 7]]
+        k_itm = next((int(kk) for lim, kk in icfg["k_by_elapsed"] if elapsed < float(lim)), 0)
+        use_itm = k_itm > 0
     bank = PhraseBank(lambda t: encode_texts(model, t))
     orders, heads = [], []
     for s in range(0, len(queries), TXT_BATCH):
@@ -381,8 +385,9 @@ def predict(model, queries, candidates, top_k=5):
         sel = [n for n in range(len(queries)) if tau_itm is None or float(heads[n][0] - heads[n][1]) < tau_itm]
         # 같은 후보를 보는 질의끼리 묶어 BLIP 이미지 특징 재계산을 줄인다 (각 질의의 결과는 묶음과 무관)
         sel.sort(key=lambda n: orders[n][0])
-        for s in range(0, len(sel), ITM_QBATCH):
-            chunk = sel[s:s + ITM_QBATCH]
+        qb = max(16, ITM_QBATCH * 5 // max(k_itm, 1))                 # 한 묶음의 쌍 수를 k와 무관하게 비슷하게 (GPU 메모리)
+        for s in range(0, len(sel), qb):
+            chunk = sel[s:s + qb]
             texts = [queries[n]["prompt"] for n in chunk for _ in range(k_itm)]
             img_idx = [orders[n][j] for n in chunk for j in range(k_itm)]
             sc = itm_scores(model, raw, img_idx, texts).view(len(chunk), k_itm)
@@ -392,6 +397,7 @@ def predict(model, queries, candidates, top_k=5):
                 orders[n] = [orders[n][j] for j in hi.tolist()] + orders[n][k_itm:]
                 heads[n] = torch.cat([hs, heads[n][k_itm:].to(hs)])
     timing["itm_used"] = bool(use_itm and lam_itm > 0)
+    timing["itm_k"] = k_itm if timing["itm_used"] else 0
     timing["itm_end_sec"] = round(time.perf_counter() - t0, 1)
     ocfg, ccfg = cfg.get("owl") or {}, cfg.get("color") or {}
     if model.get("owl") is not None and (ocfg.get("use") or ccfg.get("use")):
