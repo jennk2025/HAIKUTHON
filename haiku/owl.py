@@ -40,7 +40,7 @@ class OwlChecker:
 
     @torch.inference_mode()
     def detect(self, items, bs=16):
-        """items: [(image_path, (name, ...))] → {(path, names): {name: (score, cx, cy)}} (cx, cy는 0~1, 아래로 갈수록 cy 증가)."""
+        """items: [(image_path, (name, ...))] → {(path, names): {name: (score, cx, cy, w, h)}} (0~1, 아래로 갈수록 cy 증가)."""
         todo = [it for it in dict.fromkeys(items) if it not in self.cache]
         t0 = time.perf_counter()
         for s in range(0, len(todo), bs):
@@ -61,7 +61,8 @@ class OwlChecker:
                 det = {}
                 for q, name in enumerate(names):
                     j = int(probs[b, :, q].argmax())
-                    det[name] = (float(probs[b, j, q]), float(boxes[b, j, 0]), float(boxes[b, j, 1]))
+                    det[name] = (float(probs[b, j, q]), float(boxes[b, j, 0]), float(boxes[b, j, 1]),
+                                 float(boxes[b, j, 2]), float(boxes[b, j, 3]))
                 self.cache[(path, names)] = det
             self.n_forward += len(chunk)
         self.sec += time.perf_counter() - t0
@@ -74,7 +75,7 @@ def relation_score(det, rels, thr, margin):
     for rel, x, y in rels:
         if x not in det or y not in det:
             continue
-        (sx, xx, xy), (sy, yx, yy) = det[x], det[y]
+        (sx, xx, xy), (sy, yx, yy) = det[x][:3], det[y][:3]
         if min(sx, sy) < thr:
             continue
         d = (yx - xx) if rel == "left_of" else (yy - xy)                 # x가 y의 왼쪽/위면 양수

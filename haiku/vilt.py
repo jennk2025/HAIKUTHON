@@ -220,6 +220,11 @@ def train_vilt(rows, train_ids, device="cuda", epochs=3, lr=2e-5, queries_per_st
                    "train_queries": len(train_ids)}
 
 
+def color_chk_conds(prompt):
+    from haiku.colorcrop import crop_conditions
+    return crop_conditions(prompt)
+
+
 def v3_groups(rows, split, seed=0, dev_frac=0.15):
     """v3 조합 평가와 같은 분할: 학습 분할을 ITM 학습 그룹(ft)과 개발 그룹(dev)으로 나눈다. 검증(va)은 그대로."""
     import random
@@ -236,12 +241,14 @@ def v3_groups(rows, split, seed=0, dev_frac=0.15):
 def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list=(3, 5),
               lam_grid=(0.01, 0.02, 0.05, 0.1, 0.2), w_grid=(0.0, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0),
               seed=0, dev_frac=0.15, epochs=3, device="cuda", limit=None,
-              owl_chk=None, thr_grid=(0.05, 0.1, 0.15, 0.2, 0.3), margin_grid=(0.03, 0.06, 0.1)):
+              owl_chk=None, thr_grid=(0.05, 0.1, 0.15, 0.2, 0.3), margin_grid=(0.03, 0.06, 0.1),
+              color_chk=None, mu_grid=(0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0)):
     """v3와 같은 구조(SigLIP → 조건 재정렬 → 학습한 BLIP)를 공정하게 재현하고, 그 위에 다른 점검을 더하면 좋아지는지 본다.
     - BLIP은 ITM 학습 그룹으로만 학습한다 (개발·검증 그룹은 보지 않음, v3 ①과 같은 분할).
     - vilt: 점수기 하나 또는 {이름: 점수기}. v3 순서의 상위 2장 점수에 w × 점수를 더해 두 장의 순서만 다시 정한다.
     - owl_chk: 있으면 v3 상위 2장에 OWL 좌우·상하 규칙도 적용한다 (v4와 같은 위치).
-    - k·λ·w·OWL 기준값은 모두 개발 그룹에서 정하고, 검증 800질의에서 한 번만 보고한다."""
+    - color_chk: 있으면 v3 상위 2장에서 물체 영역별 색 비교(haiku.colorcrop)도 적용한다 (두 후보 모두 찾은 조건만).
+    - k·λ·w·OWL 기준값·색 비중 μ는 모두 개발 그룹에서 정하고, 검증 800질의에서 한 번만 보고한다."""
     import argparse
 
     from haiku.combo import prepare
@@ -338,6 +345,7 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
                 rk.append(rank(o, it))
             return rk
 
+        t_owl0, n_owl0 = owl_chk.sec, owl_chk.n_forward
         d_p, v_p = owl_prep(dev_items, dev, d_o), owl_prep(val_items, va, v_o)
         og = {(t, m): score(owl_ranks(dev_items, d_o, d_p, t, m)) for t in thr_grid for m in margin_grid}
         t, m = max(og, key=og.get)
@@ -345,5 +353,45 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
         res["val_v3+OWL(v4값 0.1/0.06)"] = met(owl_ranks(val_items, v_o, v_p, 0.1, 0.06))
         chosen.update({"owl_thr": t, "owl_margin": m, "dev_v3+OWL": round(og[(t, m)], 4)})
         res["val_relation_queries"] = sum(p is not None for p in v_p)
+        res["owl_relation_images"] = owl_chk.n_forward - n_owl0
+        res["owl_sec_per_image"] = round((owl_chk.sec - t_owl0) / max(owl_chk.n_forward - n_owl0, 1), 4)
+    if color_chk is not None:
+        from haiku.colorcrop import pair_scores
+
+        def color_vals(items, g_ids, orders):
+            its = [(by_id[g_ids[o[j]]]["image_path"], prompts[it["q"]]) for it, (o, _) in zip(items, orders) for j in (0, 1)]
+            per = color_chk.margins(its)
+            v, used = [], 0
+            for n in range(len(items)):
+                sa, sb, u = pair_scores(per[2 * n], per[2 * n + 1], "crop")
+                v += [sa, sb]
+                used += u > 0
+            return v, used, its
+
+        o0, n0, c0, s0 = color_chk.owl.sec, color_chk.owl.n_forward, color_chk.n_crops, color_chk.crop_sec
+        (d_c, _, _), (v_c, v_used, v_its) = color_vals(dev_items, dev, d_o), color_vals(val_items, va, v_o)
+        cg = {mu: score(with_w(dev_items, d_o, d_c, mu)) for mu in mu_grid}
+        mu = max(cg, key=cg.get)
+        res["val_v3+COLOR"] = met(with_w(val_items, v_o, v_c, mu))
+        chosen.update({"mu_color": mu, "dev_v3+COLOR": round(cg[mu], 4)})
+        rel_imgs = {p for pr in (v_p if owl_chk is not None else []) if pr for p in pr[2]}
+        col_imgs = {path for (path, prompt) in v_its if color_chk_conds(prompt)}
+        res["color"] = {"val_queries_with_color_cond": sum(1 for it in val_items if color_chk_conds(prompts[it["q"]])),
+                        "val_queries_decided": v_used,
+                        "val_images_for_color": len(col_imgs), "extra_images_beyond_relation": len(col_imgs - rel_imgs),
+                        "owl_new_forwards": color_chk.owl.n_forward - n0,
+                        "owl_sec_per_image": round((color_chk.owl.sec - o0) / max(color_chk.owl.n_forward - n0, 1), 4),
+                        "crops": color_chk.n_crops - c0,
+                        "crop_sec_per_crop": round((color_chk.crop_sec - s0) / max(color_chk.n_crops - c0, 1), 4)}
+        if owl_chk is not None:
+            def swapped(items, orders, v, w):
+                out = []
+                for n, (order, sc) in enumerate(orders):
+                    if sc[1] + w * v[2 * n + 1] > sc[0] + w * v[2 * n]:
+                        order, sc = [order[1], order[0]] + order[2:], [sc[1], sc[0]] + sc[2:]
+                    out.append((order, sc))
+                return out
+            v_oc = swapped(val_items, v_o, v_c, mu)
+            res["val_v3+COLOR+OWL"] = met(owl_ranks(val_items, v_oc, owl_prep(val_items, va, v_oc), t, m))
     res["chosen_on_dev"] = chosen
     return res
