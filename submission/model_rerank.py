@@ -5,8 +5,11 @@
 2. 질의마다 원문으로 상위 K개 후보를 찾는다.
 3. 질의 문장 하나에서 규칙으로 객체별 조건과 대조 문구를 만들고, 후보 K개의 조건 점수를 원래 점수에 더한다.
 4. (models/blip이 있고 설정에서 켰을 때) 조건 재정렬 결과의 상위 k개를 BLIP ITM(교차 어텐션)으로 다시 채점해 더한다.
-5. (models/owl이 있고 설정에서 켰을 때) 질의에 단일 물체 사이의 좌우·상하 관계가 있으면, 최종 상위 2장에서
-   두 물체를 OWL-ViT로 검출해 상자 중심을 비교하고, 2위가 관계를 더 잘 지키면 두 장의 순서만 바꾼다.
+5. (설정 color.use) 물체별 색 비교: 질의의 color_x 조건(물체 하나에 색 하나, 대조 = 같은 질의의 다른 물체 색)마다
+   상위 2장에서 OWL로 그 물체 상자를 찾아 잘라 SigLIP으로 색 문구를 비교한다. 두 후보 모두에서 찾은 조건만 쓰고,
+   2위의 (점수 + μ × 색 여백)이 더 크면 두 장의 순서만 바꾼다.
+6. (설정 owl.use) 질의에 단일 물체 사이의 관계(owl.kinds: 좌우·상하, 확장 시 위에 놓임·안·타고 있음·옆)가 있으면
+   최종 상위 2장에서 두 물체를 OWL-ViT로 검출해 상자 규칙으로 비교하고, 2위가 관계를 더 잘 지키면 순서만 바꾼다.
    검출은 (후보 이미지, 물체 이름)마다 독립이라 같은 이미지를 보는 질의끼리 계산만 공유한다.
 - 각 질의의 순위는 그 질의 문장과 후보 이미지만으로 계산한다. 다른 질의의 결과로 보정하지 않는다.
 - 같은 문구의 임베딩은 재사용한다 (값이 문구만으로 정해지므로 다른 질의에 의존하지 않음).
@@ -55,7 +58,7 @@ def load_model(model_dir, device):
         model["blip"] = blip
         model["blip_proc"] = AutoProcessor.from_pretrained(root / "blip", local_files_only=True)
     model["owl"] = None
-    if (cfg.get("owl") or {}).get("use") and (root / "owl").exists():
+    if ((cfg.get("owl") or {}).get("use") or (cfg.get("color") or {}).get("use")) and (root / "owl").exists():
         from transformers import OwlViTForObjectDetection, OwlViTProcessor
         model["owl"] = OwlViTForObjectDetection.from_pretrained(root / "owl", local_files_only=True, dtype=dtype).to(device).eval()
         model["owl_proc"] = OwlViTProcessor.from_pretrained(root / "owl", local_files_only=True)
@@ -179,64 +182,149 @@ def itm_scores(model, raw, img_idx, texts):
 
 
 @torch.inference_mode()
-def owl_detect(model, paths, need):
-    """need: {후보 번호: {물체 이름}} → {(후보 번호, 이름): (검출 점수, cx, cy)}.
-    이름마다 점수가 가장 높은 상자 하나 (haiku.owl.OwlChecker.detect와 같은 계산, 이미지는 한 번만 읽음)."""
+def owl_detect(model, paths, need, crop_need=None, crop_thr=0.1, pad=0.1):
+    """need: {후보 번호: {물체 이름}} → det {(후보 번호, 이름): (검출 점수, cx, cy, w, h)} (이름마다 점수가 가장 높은 상자 하나,
+    haiku.owl.OwlChecker.detect와 같은 계산, 이미지는 한 번만 읽음).
+    crop_need: {후보 번호: {이름}} — 검출 점수가 crop_thr 이상인 상자를 10% 넓혀 잘라 SigLIP 벡터를 만든다 (같은 읽기 재사용).
+    반환: (det, crops {(후보 번호, 이름): 정규화 벡터})"""
     owl, proc, dev = model["owl"], model["owl_proc"], model["device"]
     names = sorted({n for v in need.values() for n in v})
     row = {n: k for k, n in enumerate(names)}
     tok = proc.tokenizer([f"a photo of a {n}" for n in names] + [" "], padding="max_length", truncation=True,
                          return_tensors="pt").to(dev)
-    pad = len(names)
+    pad_row = len(names)
     js = sorted(need)
-    dl = torch.utils.data.DataLoader(_Images([paths[j] for j in js], proc.image_processor), batch_size=OWL_BATCH,
+    ip = proc.image_processor
+    dl = torch.utils.data.DataLoader(_Images([paths[j] for j in js], ip), batch_size=OWL_BATCH,
                                      num_workers=WORKERS, pin_memory=dev.type == "cuda")
-    out, s = {}, 0
+    o_mean = torch.tensor(ip.image_mean, device=dev).view(3, 1, 1)
+    o_std = torch.tensor(ip.image_std, device=dev).view(3, 1, 1)
+    net, sip = model["net"], model["proc"].image_processor
+    s_size = _size(sip)
+    s_mean = torch.tensor(sip.image_mean, device=dev).view(1, 3, 1, 1)
+    s_std = torch.tensor(sip.image_std, device=dev).view(1, 3, 1, 1)
+    det, crops, pending = {}, {}, []
+
+    def flush():
+        if pending:
+            x = ((torch.stack([t for _, t in pending]) - s_mean) / s_std).to(net.dtype)
+            v = normalize(_feats(net.get_image_features(pixel_values=x)).float(), dim=-1)
+            for (key, _), vec in zip(pending, v):
+                crops[key] = vec
+            pending.clear()
+
+    s = 0
     for px in dl:
         chunk = js[s:s + len(px)]
         s += len(px)
         lists = [sorted(need[j]) for j in chunk]
         width = max(len(l) for l in lists)
-        ridx = torch.tensor([[row[n] for n in l] + [pad] * (width - len(l)) for l in lists], device=dev).view(-1)
+        ridx = torch.tensor([[row[n] for n in l] + [pad_row] * (width - len(l)) for l in lists], device=dev).view(-1)
+        pxd = px.to(dev, non_blocking=True)
         o = owl(input_ids=tok["input_ids"][ridx], attention_mask=tok["attention_mask"][ridx],
-                pixel_values=px.to(dev, dtype=next(owl.parameters()).dtype, non_blocking=True))
+                pixel_values=pxd.to(next(owl.parameters()).dtype))
         probs, boxes = o.logits.float().sigmoid(), o.pred_boxes.float()
         best = probs.argmax(dim=1)                                          # (B, 질의 수)
         for b, (j, l) in enumerate(zip(chunk, lists)):
             for q, n in enumerate(l):
                 p = int(best[b, q])
-                out[(j, n)] = (float(probs[b, p, q]), float(boxes[b, p, 0]), float(boxes[b, p, 1]))
+                box = (float(probs[b, p, q]),) + tuple(float(x) for x in boxes[b, p, :4])
+                det[(j, n)] = box
+                if crop_need and n in crop_need.get(j, ()) and box[0] >= crop_thr:
+                    img = (pxd[b].float() * o_std + o_mean).clamp(0, 1)          # OWL 입력을 원래 화소로 되돌림
+                    H, W = img.shape[1:]
+                    _, cx, cy, w, h = box
+                    x0 = min(max(0, int((cx - w / 2 - pad * w) * W)), W - 8)
+                    y0 = min(max(0, int((cy - h / 2 - pad * h) * H)), H - 8)
+                    x1 = min(W, max(int((cx + w / 2 + pad * w) * W), x0 + 8))
+                    y1 = min(H, max(int((cy + h / 2 + pad * h) * H), y0 + 8))
+                    c = F.interpolate(img[:, y0:y1, x0:x1][None], size=(s_size, s_size), mode="bicubic",
+                                      antialias=True, align_corners=False)[0].clamp(0, 1)
+                    pending.append(((j, n), c))
+                    if len(pending) >= IMG_BATCH:
+                        flush()
+    flush()
+    return det, crops
+
+
+def _crop_conds(prompt):
+    """질의 하나 → [(물체 이름, target 문구, [대조 문구])] (color_x: 물체 하나에 색 하나, 대조 = 다른 물체의 색)."""
+    out = []
+    for c in extract_conditions(prompt):
+        if c["kind"] == "color_x" and c["contrasts"]:
+            out.append((c["key"].split("[", 1)[1].split("]", 1)[0], c["target"], list(c["contrasts"])))
     return out
 
 
-def owl_rerank(model, queries, paths, orders, ocfg, t0, t_img_per):
-    """관계 질의의 최종 상위 2장만 OWL 규칙으로 다시 본다. 시간이 모자랄 것 같으면 모든 질의에서 건너뛴다."""
+def owl_rerank(model, queries, paths, orders, scores, ocfg, ccfg, t0, t_img_per):
+    """최종 상위 2장만 다시 본다: (켜져 있으면) 물체별 색 → OWL 관계 규칙 순서.
+    시간 안전장치는 이 단계 직전에 한 번만, 모든 질의에 똑같이 정한다: 둘 다 → OWL 관계만 → 둘 다 건너뜀."""
     from haiku.owl import relation_score, spatial_relations
+    kinds = tuple(ocfg.get("kinds") or ("left_of", "above"))
     rels, need = {}, {}
-    for n, q in enumerate(queries):
-        r = spatial_relations(q["prompt"])
-        if r and len(orders[n]) >= 2:
-            names = tuple(sorted({x for _, a, b in r for x in (a, b)}))
-            rels[n] = (r, names)
-            for j in orders[n][:2]:
-                need.setdefault(j, set()).update(names)
-    info = {"owl_queries": len(rels), "owl_images": len(need), "owl_used": False}
+    if ocfg.get("use"):
+        for n, q in enumerate(queries):
+            r = spatial_relations(q["prompt"], kinds)
+            if r and len(orders[n]) >= 2:
+                names = tuple(sorted({x for _, a, b in r for x in (a, b)}))
+                rels[n] = (r, names)
+                for j in orders[n][:2]:
+                    need.setdefault(j, set()).update(names)
+    cols, cneed = {}, {}
+    if ccfg.get("use"):
+        for n, q in enumerate(queries):
+            cs = _crop_conds(q["prompt"])
+            if cs and len(orders[n]) >= 2:
+                cols[n] = cs
+                for j in orders[n][:2]:
+                    cneed.setdefault(j, set()).update(x for x, _, _ in cs)
+    all_need = {j: set(v) for j, v in need.items()}
+    for j, v in cneed.items():
+        all_need.setdefault(j, set()).update(v)
+    per = t_img_per * float(ocfg.get("cost_factor", 1.5))
+    budget = float(ocfg.get("budget_sec", 830))
     elapsed = time.perf_counter() - t0
-    projected = len(need) * t_img_per * float(ocfg.get("cost_factor", 1.5))
-    info.update(owl_projected_sec=round(projected, 1), owl_start_sec=round(elapsed, 1))
-    if not rels or elapsed + projected > float(ocfg.get("budget_sec", 830)):
+    info = {"owl_queries": len(rels), "color_queries": len(cols), "owl_images": len(all_need), "owl_used": False,
+            "color_used": False, "owl_start_sec": round(elapsed, 1), "owl_projected_sec": round(len(all_need) * per, 1)}
+    if cols and elapsed + len(all_need) * per <= budget:
+        pass                                                                # 색 + 관계 모두
+    elif rels and elapsed + len(need) * per <= budget:
+        cols, cneed, all_need = {}, {}, need                                # 시간이 빠듯하면 관계만
+    else:
         return info
-    det = owl_detect(model, paths, need)
-    thr, margin = float(ocfg.get("thr", 0.1)), float(ocfg.get("margin", 0.06))
-    swapped = 0
-    for n, (r, names) in rels.items():
-        a, b = orders[n][:2]
-        sa = relation_score({x: det[(a, x)] for x in names}, r, thr, margin)
-        sb = relation_score({x: det[(b, x)] for x in names}, r, thr, margin)
-        if sb > sa:
-            orders[n] = [b, a] + orders[n][2:]
-            swapped += 1
-    info.update(owl_used=True, owl_swapped=swapped, owl_sec=round(time.perf_counter() - t0 - elapsed, 1))
+    det, crops = owl_detect(model, paths, all_need, cneed or None, float(ccfg.get("thr", 0.1)), float(ccfg.get("pad", 0.1)))
+    if cols:
+        phrases = sorted({t for cs in cols.values() for _, a, b in cs for t in [a] + b})
+        tv = dict(zip(phrases, encode_texts(model, phrases)))
+        mu, swapped = float(ccfg.get("mu", 0.0)), 0
+        for n, cs in cols.items():
+            a, b = orders[n][:2]
+            sa = sb = 0.0
+            for name, tgt, cons in cs:
+                va, vb = crops.get((a, name)), crops.get((b, name))
+                if va is None or vb is None:                                # 두 후보 모두에서 찾은 조건만
+                    continue
+                T, C = tv[tgt], torch.stack([tv[c] for c in cons])
+                sa += float(va @ T - (C @ va).max())
+                sb += float(vb @ T - (C @ vb).max())
+            if scores[n][1] + mu * sb > scores[n][0] + mu * sa:
+                orders[n] = [b, a] + orders[n][2:]
+                scores[n] = [scores[n][1], scores[n][0]] + scores[n][2:]
+                swapped += 1
+        info.update(color_used=True, color_swapped=swapped, crops=len(crops))
+    if rels:
+        thr, margin = float(ocfg.get("thr", 0.1)), float(ocfg.get("margin", 0.06))
+        swapped = 0
+        for n, (r, names) in rels.items():
+            a, b = orders[n][:2]
+            sa = relation_score({x: det[(a, x)] for x in names}, r, thr, margin)
+            sb = relation_score({x: det[(b, x)] for x in names}, r, thr, margin)
+            if sb > sa:
+                orders[n] = [b, a] + orders[n][2:]
+                scores[n] = [scores[n][1], scores[n][0]] + scores[n][2:]
+                swapped += 1
+        info.update(owl_used=True, owl_swapped=swapped)
+    info["owl_sec"] = round(time.perf_counter() - t0 - elapsed, 1)
     return info
 
 
@@ -293,13 +381,15 @@ def predict(model, queries, candidates, top_k=5):
             sc = itm_scores(model, raw, img_idx, texts).view(len(chunk), k_itm)
             for r, n in enumerate(chunk):
                 h = heads[n][:k_itm].to(sc) + lam_itm * sc[r]
-                head = [orders[n][j] for j in h.argsort(descending=True).tolist()]
-                orders[n] = head + orders[n][k_itm:]
+                hs, hi = h.sort(descending=True)
+                orders[n] = [orders[n][j] for j in hi.tolist()] + orders[n][k_itm:]
+                heads[n] = torch.cat([hs, heads[n][k_itm:].to(hs)])
     timing["itm_used"] = bool(use_itm and lam_itm > 0)
     timing["itm_end_sec"] = round(time.perf_counter() - t0, 1)
-    ocfg = cfg.get("owl") or {}
-    if model.get("owl") is not None and ocfg.get("use"):
-        timing.update(owl_rerank(model, queries, paths, orders, ocfg, t0, t_img / max(len(paths), 1)))
+    ocfg, ccfg = cfg.get("owl") or {}, cfg.get("color") or {}
+    if model.get("owl") is not None and (ocfg.get("use") or ccfg.get("use")):
+        scores = [heads[n].float().tolist() for n in range(len(queries))]
+        timing.update(owl_rerank(model, queries, paths, orders, scores, ocfg, ccfg, t0, t_img / max(len(paths), 1)))
     timing["total_sec"] = round(time.perf_counter() - t0, 1)
     model["last_timing"] = timing
     return {q["prompt_id"]: [image_ids[j] for j in orders[n][:top_k]] for n, q in enumerate(queries)}
