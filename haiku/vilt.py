@@ -243,7 +243,7 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
               seed=0, dev_frac=0.15, epochs=3, device="cuda", limit=None,
               owl_chk=None, thr_grid=(0.05, 0.1, 0.15, 0.2, 0.3), margin_grid=(0.03, 0.06, 0.1),
               color_chk=None, mu_grid=(0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0), save_path=None, gallery="split",
-              neg_mode="sibling", n_hard=5, negatives=7, vision_layers=0):
+              neg_mode="sibling", n_hard=5, negatives=7, vision_layers=0, text_negs=0, flip_neg=False):
     """v3와 같은 구조(SigLIP → 조건 재정렬 → 학습한 BLIP)를 공정하게 재현하고, 그 위에 다른 점검을 더하면 좋아지는지 본다.
     - BLIP은 ITM 학습 그룹으로만 학습한다 (개발·검증 그룹은 보지 않음, v3 ①과 같은 분할).
     - vilt: 점수기 하나 또는 {이름: 점수기}. v3 순서의 상위 2장 점수에 w × 점수를 더해 두 장의 순서만 다시 정한다.
@@ -263,7 +263,7 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
     if limit:
         ft, dev, va = ft[:limit[0]], dev[:limit[1]], va[:limit[2]]
     ns = argparse.Namespace(blip=BLIP_ID, seed=seed, lr=2e-5, epochs=epochs, queries_per_step=8, negatives=negatives, n_hard=n_hard,
-                            vision_layers=vision_layers)
+                            vision_layers=vision_layers, text_negs=text_negs, flip_neg=flip_neg)
     neg_pool = None
     if neg_mode == "retrieval":                 # BLIP 학습 오답 = 추론 때 BLIP이 보게 될 후보 (학습 그룹 안에서만)
         from haiku.itm_finetune import retrieval_negatives

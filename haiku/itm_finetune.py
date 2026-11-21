@@ -22,6 +22,7 @@ import torch
 
 from haiku.data import load_rows
 from haiku.itm import BLIP_ID, BlipITM, run_itm_experiment
+from haiku.minpairs import has_left_right, perturb
 from haiku.siblings import build_groups, parse_prompt
 
 SIGLIP_ID = "google/siglip-base-patch16-384"
@@ -79,8 +80,11 @@ def _vision_prefix(model, proc, paths, nv, device, bs=32):
     for s in range(0, len(paths), bs):
         ims = []
         for p in paths[s:s + bs]:
-            with Image.open(p) as im:
-                ims.append(im.convert("RGB"))
+            p = str(p)
+            flip = p.endswith("::hflip")
+            with Image.open(p[:-7] if flip else p) as im:
+                im = im.convert("RGB")
+                ims.append(im.transpose(Image.Transpose.FLIP_LEFT_RIGHT) if flip else im)
         px = proc.image_processor(images=ims, return_tensors="pt")["pixel_values"].to(device)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
             h = vm.embeddings(px)
@@ -123,14 +127,20 @@ def train_itm(rows, train_ids, args, device, neg_pool=None):
     t0 = time.perf_counter()
     helper = wrap(model, proc, device)
     helper.dtype = torch.float16 if use_amp else torch.float32
+    text_negs = int(getattr(args, "text_negs", 0) or 0)                # 문장 최소 쌍 오답 수 (0 = 사용 안 함)
+    flip_neg = bool(getattr(args, "flip_neg", False))                   # 좌우 문장: 좌우 반전한 정답 이미지를 오답으로
+    flip_ids = [i for i in train_ids if flip_neg and has_left_right(by_id[i]["prompt"])]
+    paths = [str(by_id[i]["image_path"]) for i in train_ids] + [str(by_id[i]["image_path"]) + "::hflip" for i in flip_ids]
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
         if nv:
-            feats = _vision_prefix(model, proc, [by_id[i]["image_path"] for i in train_ids], nv, device)
+            feats = _vision_prefix(model, proc, paths, nv, device)
         else:
-            feats = helper.image_embeds([by_id[i]["image_path"] for i in train_ids])
+            feats = helper.image_embeds(paths)
     pos = {i: k for k, i in enumerate(train_ids)}
+    fpos = {i: len(train_ids) + k for k, i in enumerate(flip_ids)}
     vis_sec = time.perf_counter() - t0
-    print(f"비전 특징 {len(train_ids)}장 {vis_sec:.0f}초", flush=True)
+    print(f"비전 특징 {len(train_ids)}장 (+ 좌우 반전 {len(flip_ids)}장) {vis_sec:.0f}초 | 문장 최소 쌍 오답 {text_negs}개", flush=True)
+    mp_rng = random.Random(args.seed + 7)
 
     pool = set(train_ids)
     pool_list = sorted(pool)
@@ -156,12 +166,24 @@ def train_itm(rows, train_ids, args, device, neg_pool=None):
                             rest.append(x)
                     negs = hard + rest[:args.negatives - len(hard)]
                 n_sib += sum(group_of[x] == group_of[q] for x in negs)
+                neg_idx = [pos[x] for x in negs]
+                if q in fpos:
+                    neg_idx[-1] = fpos[q]                                # 마지막 오답 자리를 좌우 반전 정답 이미지로
                 texts += [by_id[q]["prompt"]] * (1 + len(negs))
-                img_idx += [pos[q]] + [pos[x] for x in negs]
+                img_idx += [pos[q]] + neg_idx
+                if text_negs:
+                    pert = perturb(by_id[q]["prompt"], mp_rng, text_negs)
+                    while len(pert) < text_negs:                        # 부족하면 다른 문장으로 채움
+                        x = rng.choice(pool_list)
+                        if x != q:
+                            pert.append(by_id[x]["prompt"])
+                    texts += [by_id[q]["prompt"]] + pert
+                    img_idx += [pos[q]] * (1 + text_negs)
             tok = proc.tokenizer(texts, padding=True, truncation=True, max_length=72, return_tensors="pt").to(device)
-            per = 1 + args.negatives
+            n_img = 1 + args.negatives
+            per = n_img + (1 + text_negs if text_negs else 0)
             # 메모리를 아끼려고 질의를 나눠 계산하고 기울기를 모은 뒤 한 번에 갱신 (손실은 질의별 평균이라 한 번에 계산한 것과 같음)
-            micro = int(getattr(args, "micro_queries", 0) or (2 if nv else len(qs)))
+            micro = int(getattr(args, "micro_queries", 0) or (2 if nv else (4 if text_negs else len(qs))))
             opt.zero_grad(set_to_none=True)
             loss_sum = 0.0
             for c in range(0, len(qs), micro):
@@ -181,8 +203,10 @@ def train_itm(rows, train_ids, args, device, neg_pool=None):
                                            encoder_attention_mask=att).last_hidden_state
                     logit = model.itm_head(h[:, 0, :]).float()
                 match = (logit[:, 1] - logit[:, 0]).view(nq, per)
-                part = torch.nn.functional.cross_entropy(match, torch.zeros(nq, dtype=torch.long, device=device),
-                                                         reduction="sum") / len(qs)
+                zero = torch.zeros(nq, dtype=torch.long, device=device)
+                part = torch.nn.functional.cross_entropy(match[:, :n_img], zero, reduction="sum") / len(qs)
+                if text_negs:                                           # 같은 이미지에서 정답 문장 vs 한 가지만 다른 문장
+                    part = part + torch.nn.functional.cross_entropy(match[:, n_img:], zero, reduction="sum") / len(qs)
                 scaler.scale(part).backward()
                 loss_sum += part.item()
             loss = torch.tensor(loss_sum)
@@ -247,6 +271,8 @@ def main():
     ap.add_argument("--neg-mode", choices=["sibling", "retrieval"], default="sibling",
                     help="retrieval: 추론 때 BLIP이 보는 후보(SigLIP+조건 재정렬 상위 10장)를 오답으로 먼저 사용")
     ap.add_argument("--n-hard", type=int, default=5)
+    ap.add_argument("--text-negs", type=int, default=0, help="문장 최소 쌍 오답 수 (한 가지만 바꾼 문장)")
+    ap.add_argument("--flip-neg", action="store_true", help="좌우 문장: 좌우 반전한 정답 이미지를 오답으로")
     ap.add_argument("--vision-layers", type=int, default=0, help="이미지 쪽 마지막 몇 층을 함께 학습할지 (0 = 고정)")
     args = ap.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

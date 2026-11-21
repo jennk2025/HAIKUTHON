@@ -39,8 +39,11 @@ class BlipITM:
         for s in range(0, len(paths), bs):
             ims = []
             for p in paths[s:s + bs]:
-                with Image.open(p) as im:
-                    ims.append(im.convert("RGB"))
+                p = str(p)
+                flip = p.endswith("::hflip")
+                with Image.open(p[:-7] if flip else p) as im:
+                    im = im.convert("RGB")
+                    ims.append(im.transpose(Image.Transpose.FLIP_LEFT_RIGHT) if flip else im)
             px = self.proc.image_processor(images=ims, return_tensors="pt")["pixel_values"].to(self.device, self.dtype)
             h = self.model.vision_model(pixel_values=px).last_hidden_state.half().cpu()
             if store is None:
