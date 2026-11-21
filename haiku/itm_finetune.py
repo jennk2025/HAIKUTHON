@@ -69,6 +69,31 @@ def retrieval_negatives(rows, ids, img_fn, txt_fn, lam_cond=3.2, K=10):
     return out
 
 
+@torch.no_grad()
+def _vision_prefix(model, proc, paths, nv, device, bs=32):
+    """이미지 쪽 앞 (전체 − nv)층까지의 출력을 한 번만 계산해 CPU에 fp16으로 보관 (마지막 nv층만 학습할 때)."""
+    from PIL import Image
+    vm = model.vision_model
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+    out = None
+    for s in range(0, len(paths), bs):
+        ims = []
+        for p in paths[s:s + bs]:
+            with Image.open(p) as im:
+                ims.append(im.convert("RGB"))
+        px = proc.image_processor(images=ims, return_tensors="pt")["pixel_values"].to(device)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+            h = vm.embeddings(px)
+            for lyr in vm.encoder.layers[:-nv]:
+                o = lyr(h)
+                h = o[0] if isinstance(o, tuple) else o
+        h = h.to(torch.float16 if device.type == "cuda" else torch.float32).cpu()
+        if out is None:
+            out = torch.empty((len(paths),) + tuple(h.shape[1:]), dtype=h.dtype)
+        out[s:s + len(h)] = h
+    return out
+
+
 def train_itm(rows, train_ids, args, device, neg_pool=None):
     """neg_pool: {질의 ID: [오답 후보 ID, 어려운 순]} 이 있으면 앞에서 n_hard개를 먼저 쓰고 나머지는 형제 오답으로 채운다."""
     from transformers import AutoProcessor, BlipForImageTextRetrieval
@@ -81,8 +106,16 @@ def train_itm(rows, train_ids, args, device, neg_pool=None):
     model.requires_grad_(False)
     model.text_encoder.requires_grad_(True)
     model.itm_head.requires_grad_(True)
-    params = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
+    nv = int(getattr(args, "vision_layers", 0) or 0)                    # 이미지 쪽 마지막 nv층도 학습 (0이면 이미지 쪽 고정)
+    vm = model.vision_model
+    if nv:
+        vm.encoder.layers[-nv:].requires_grad_(True)
+        vm.post_layernorm.requires_grad_(True)
+    vparams = [p for p in vm.parameters() if p.requires_grad]
+    tparams = [p for p in model.parameters() if p.requires_grad and all(p is not q for q in vparams)]
+    params = tparams + vparams
+    groups = [{"params": tparams, "lr": args.lr}] + ([{"params": vparams, "lr": args.lr * 0.5}] if vparams else [])
+    opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=0.01)
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -91,7 +124,10 @@ def train_itm(rows, train_ids, args, device, neg_pool=None):
     helper = wrap(model, proc, device)
     helper.dtype = torch.float16 if use_amp else torch.float32
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-        feats = helper.image_embeds([by_id[i]["image_path"] for i in train_ids])
+        if nv:
+            feats = _vision_prefix(model, proc, [by_id[i]["image_path"] for i in train_ids], nv, device)
+        else:
+            feats = helper.image_embeds([by_id[i]["image_path"] for i in train_ids])
     pos = {i: k for k, i in enumerate(train_ids)}
     vis_sec = time.perf_counter() - t0
     print(f"비전 특징 {len(train_ids)}장 {vis_sec:.0f}초", flush=True)
@@ -124,6 +160,13 @@ def train_itm(rows, train_ids, args, device, neg_pool=None):
                 img_idx += [pos[q]] + [pos[x] for x in negs]
             tok = proc.tokenizer(texts, padding=True, truncation=True, max_length=72, return_tensors="pt").to(device)
             img = feats[img_idx].to(device)
+            if nv:                                                      # 저장해 둔 앞쪽 층 출력 → 학습하는 마지막 층들
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                    h = img.float() if not use_amp else img
+                    for lyr in vm.encoder.layers[-nv:]:
+                        o = lyr(h)
+                        h = o[0] if isinstance(o, tuple) else o
+                    img = vm.post_layernorm(h)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 att = torch.ones(img.shape[:-1], dtype=torch.long, device=device)
                 h = model.text_encoder(input_ids=tok["input_ids"], attention_mask=tok["attention_mask"],
@@ -195,6 +238,7 @@ def main():
     ap.add_argument("--neg-mode", choices=["sibling", "retrieval"], default="sibling",
                     help="retrieval: 추론 때 BLIP이 보는 후보(SigLIP+조건 재정렬 상위 10장)를 오답으로 먼저 사용")
     ap.add_argument("--n-hard", type=int, default=5)
+    ap.add_argument("--vision-layers", type=int, default=0, help="이미지 쪽 마지막 몇 층을 함께 학습할지 (0 = 고정)")
     args = ap.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     rows = load_rows(args.data_dir)
