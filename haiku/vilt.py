@@ -242,7 +242,7 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
               lam_grid=(0.01, 0.02, 0.05, 0.1, 0.2), w_grid=(0.0, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0),
               seed=0, dev_frac=0.15, epochs=3, device="cuda", limit=None,
               owl_chk=None, thr_grid=(0.05, 0.1, 0.15, 0.2, 0.3), margin_grid=(0.03, 0.06, 0.1),
-              color_chk=None, mu_grid=(0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0)):
+              color_chk=None, mu_grid=(0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0), save_path=None):
     """v3와 같은 구조(SigLIP → 조건 재정렬 → 학습한 BLIP)를 공정하게 재현하고, 그 위에 다른 점검을 더하면 좋아지는지 본다.
     - BLIP은 ITM 학습 그룹으로만 학습한다 (개발·검증 그룹은 보지 않음, v3 ①과 같은 분할).
     - vilt: 점수기 하나 또는 {이름: 점수기}. v3 순서의 상위 2장 점수에 w × 점수를 더해 두 장의 순서만 다시 정한다.
@@ -309,6 +309,8 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
     res = {"sizes": {"itm_train": len(ft), "dev": len(dev), "val": len(va)}, "train": info,
            "val_search_only": met(search), "val_v3": met(v3), "val_v3_gold_exactly_2nd": sum(r == 2 for r in v3)}
     per_q = {"q": [it["q"] for it in val_items], "ranks": {"search": search, "v3": v3}}
+    per_q["ranks"]["cond"] = [it["idxB"].index(it["gold"]) + 1 if it["gold"] in it["idxB"] else it["base_rank"]
+                              for it in val_items]                      # 조건 재정렬 직후 (BLIP 전)
     _met = met
 
     def met(rk, name=None):                         # 보고용 지표 + 질의별 순위 보관
@@ -372,6 +374,25 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
         chosen.update({"owl_ext_thr": tx, "owl_ext_margin": mx, "dev_v3+OWL확장": round(ogx[(tx, mx)], 4)})
         res["val_relation_queries_ext"] = sum(p is not None for p in v_px)
         res["owl_ext_new_images"] = owl_chk.n_forward - n_ext0
+
+        def owl_orders(items, orders, prep, thr, mg):
+            out, flags = [], []
+            for (o, sc), pr in zip(orders, prep):
+                sw = False
+                if pr:
+                    rels, names, paths = pr
+                    sa, sb = (relation_score(owl_chk.cache[(p, names)], rels, thr, mg) for p in paths)
+                    if sb > sa:
+                        o, sc, sw = [o[1], o[0]] + o[2:], [sc[1], sc[0]] + list(sc[2:]), True
+                out.append((o, sc))
+                flags.append(sw)
+            return out, flags
+
+        d5_o, _ = owl_orders(dev_items, d_o, d_px, tx, mx)
+        v5_o, v5_sw = owl_orders(val_items, v_o, v_px, tx, mx)            # v5 = v3 + OWL 확장 (제출한 설정)
+        per_q["top2_v5"] = [[va[o[0]], va[o[1]]] for o, _ in v5_o]
+        per_q["owl_ext_applicable"] = [p is not None for p in v_px]
+        per_q["owl_ext_swapped"] = v5_sw
     if color_chk is not None:
         from haiku.colorcrop import pair_scores
 
@@ -412,4 +433,14 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
             res["val_v3+COLOR+OWL"] = met(owl_ranks(val_items, v_oc, owl_prep(val_items, va, v_oc), t, m), "v3+COLOR+OWL")
     res["chosen_on_dev"] = chosen
     res["per_query"] = per_q
+    if save_path:                                                       # 다음 실험이 BLIP을 다시 학습하지 않도록 저장
+        pack = lambda items: [{"q": it["q"], "gold": it["gold"], "base_rank": it["base_rank"], "idxB": list(it["idxB"]),
+                               "sB": [float(x) for x in it["sB"]], "itm": [float(x) for x in it["itm"]]} for it in items]
+        save = {"dev": dev, "va": va, "k": k, "lam": lam, "dev_items": pack(dev_items), "val_items": pack(val_items),
+                "v3_orders": {"dev": [(list(o), list(sc)) for o, sc in d_o], "val": [(list(o), list(sc)) for o, sc in v_o]},
+                "chosen": chosen}
+        if owl_chk is not None:
+            save["v5_orders"] = {"dev": [(list(o), list(sc)) for o, sc in d5_o], "val": [(list(o), list(sc)) for o, sc in v5_o]}
+        torch.save(save, save_path)
+        res["saved"] = str(save_path)
     return res

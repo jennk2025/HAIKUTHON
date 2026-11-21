@@ -88,3 +88,55 @@ def by_relation(rows, per_query, variants=("v3", "v3+OWL(v4값 0.1/0.06)", "v3+O
         accs = [sum(per_query["ranks"][v][i] == 1 for i in idx) / len(idx) for v in variants]
         L.append(f"  {ko:16s} 질의 {len(idx):4d}  " + " → ".join(f"{a:.3f}" for a in accs))
     return "\n".join(L)
+
+
+def diagnose(rows, per_query, variant="v3+OWL확장", k_blip=5, n_cases=30, seed=0):
+    """정답을 어느 단계에서 잃는가 + 최종 2위로 남은 사례의 원인 분류 (검증 데이터 분석용, 순위 계산에는 쓰지 않음).
+    원인은 정답 문장과 1위 오답 이미지의 원래 문장을 규칙 파서로 비교해 정한다."""
+    import random
+    from collections import Counter
+
+    from haiku.siblings import CAT_KO, compare, fmt_diffs, parse_prompt
+    by_id = {r["id"]: r for r in rows}
+    q, R = per_query["q"], per_query["ranks"]
+    fin, s, c = R[variant], R["search"], R.get("cond")
+    n = len(q)
+    L = [f"===== 정답을 어디서 잃는가 ({variant}, 검증 {n}질의) ====="]
+    L.append(f"  검색 상위 10장 밖 (첫 검색에서 놓침)               {sum(r > 10 for r in s):4d}")
+    if c:
+        L.append(f"  상위 10장 안이었지만 조건 재정렬 후 BLIP이 보는 {k_blip}장 밖 {sum(a <= 10 and b > k_blip for a, b in zip(s, c)):4d}")
+    L.append(f"  최종 1위 {sum(r == 1 for r in fin)} | 2위 {sum(r == 2 for r in fin)} | 3~5위 {sum(2 < r <= 5 for r in fin)} | 5위 밖 {sum(r > 5 for r in fin)}")
+    if "owl_ext_applicable" in per_query:
+        app = per_query["owl_ext_applicable"]
+        L.append(f"  OWL 적용 가능 질의 {sum(app)} | 그중 순서를 바꾼 질의 {sum(per_query['owl_ext_swapped'])}")
+    if "top2_v5" not in per_query:
+        return "\n".join(L)
+    labels, details = Counter(), []
+    for i in range(n):
+        if fin[i] != 2:
+            continue
+        gold, wrong = q[i], per_query["top2_v5"][i][0]
+        pa, pb = parse_prompt(by_id[gold]["prompt"]), parse_prompt(by_id[wrong]["prompt"])
+        multi = any(f.startswith("multi_instance:") for f in pa["flags"])
+        if set(pa["objects"]) != set(pb["objects"]):
+            lab, why = "물체 구성이 다른 후보", ""
+        else:
+            diffs = compare(pa, pb)
+            obj = sorted({d[0] for d in diffs if d[1] == "explicit" and d[2] != "scene"})
+            if multi:
+                lab = "같은 종류 물체가 여러 개"
+            elif not obj:
+                lab = "명시 차이 없음(장면만 다르거나 파서가 놓침)"
+            else:
+                lab = "+".join(CAT_KO.get(x, x) for x in obj)
+            why = fmt_diffs(diffs, "explicit")
+        labels[lab] += 1
+        details.append((gold, wrong, lab, why, by_id[gold]["prompt"]))
+    L.append(f"\n===== 최종 2위로 남은 {len(details)}개: 정답과 1위 오답의 차이 =====")
+    for lab, cnt in labels.most_common():
+        L.append(f"  {cnt:3d}  {lab}")
+    L.append(f"\n----- 사례 {min(n_cases, len(details))}개 (seed {seed}) -----")
+    for gold, wrong, lab, why, text in random.Random(seed).sample(details, min(n_cases, len(details))):
+        L.append(f"  [{gold} 정답 / {wrong} 1위] {lab} | {why[:90]}")
+        L.append(f"      {text[:160]}")
+    return "\n".join(L)
