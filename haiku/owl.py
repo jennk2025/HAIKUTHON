@@ -41,6 +41,7 @@ class OwlChecker:
         self.proc = OwlViTProcessor.from_pretrained(model_id, local_files_only=local_files_only)
         self.dtype = dtype
         self.cache, self.n_forward, self.sec = {}, 0, 0.0
+        self.multi_cache = {}
 
     @torch.inference_mode()
     def detect(self, items, bs=16):
@@ -71,6 +72,55 @@ class OwlChecker:
             self.n_forward += len(chunk)
         self.sec += time.perf_counter() - t0
         return {it: self.cache[it] for it in items}
+
+
+    @torch.inference_mode()
+    def detect_multi(self, items, max_boxes=3, thr=0.05, iou=0.5, bs=16):
+        """items: [(image_path, name)] → self.multi_cache[(path, name)] = [(score, cx, cy, w, h), ...]
+        이름마다 점수 순으로 겹치는 상자를 빼고 최대 max_boxes개 (같은 종류 물체 여러 개를 찾기 위함)."""
+        by_path = {}
+        for path, name in items:
+            if (path, name) not in self.multi_cache:
+                by_path.setdefault(path, set()).add(name)
+        paths = sorted(by_path)
+        t0 = time.perf_counter()
+        for s in range(0, len(paths), bs):
+            chunk = paths[s:s + bs]
+            ims = []
+            for path in chunk:
+                with Image.open(path) as im:
+                    ims.append(im.convert("RGB"))
+            names_l = [sorted(by_path[p]) for p in chunk]
+            width = max(len(l) for l in names_l)
+            texts = [[f"a photo of a {n}" for n in l] + [" "] * (width - len(l)) for l in names_l]
+            inp = self.proc(text=texts, images=ims, return_tensors="pt", padding="max_length", truncation=True).to(self.device)
+            inp["pixel_values"] = inp["pixel_values"].to(self.dtype)
+            out = self.model(**inp)
+            probs, boxes = out.logits.float().sigmoid(), out.pred_boxes.float()
+            for b, (path, l) in enumerate(zip(chunk, names_l)):
+                for q, n in enumerate(l):
+                    sc, order = probs[b, :, q].sort(descending=True)
+                    kept = []
+                    for v, i in zip(sc[:100].tolist(), order[:100].tolist()):
+                        if v < thr:
+                            break
+                        bx = boxes[b, i].tolist()
+                        if all(_iou(bx, k[1:]) < iou for k in kept):
+                            kept.append((v, *bx))
+                            if len(kept) >= max_boxes:
+                                break
+                    self.multi_cache[(path, n)] = kept
+            self.n_forward += len(chunk)
+        self.sec += time.perf_counter() - t0
+
+
+def _iou(a, b):
+    """(cx, cy, w, h) 두 상자의 IoU."""
+    ax0, ay0, ax1, ay1 = a[0] - a[2] / 2, a[1] - a[3] / 2, a[0] + a[2] / 2, a[1] + a[3] / 2
+    bx0, by0, bx1, by1 = b[0] - b[2] / 2, b[1] - b[3] / 2, b[0] + b[2] / 2, b[1] + b[3] / 2
+    iw, ih = max(0.0, min(ax1, bx1) - max(ax0, bx0)), max(0.0, min(ay1, by1) - max(ay0, by0))
+    inter = iw * ih
+    return inter / max(a[2] * a[3] + b[2] * b[3] - inter, 1e-6)
 
 
 def _rel_value(rel, a, b, margin):
