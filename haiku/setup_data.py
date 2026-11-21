@@ -18,14 +18,12 @@ DATA_TAR_NAME = "haikuthon-train.tar"
 
 
 def detect_env():
-    if Path("/kaggle").exists():
+    """Colab을 먼저 확인한다. 최근 Colab 런타임에는 /kaggle 폴더가 있어서 폴더만으로는 구분할 수 없다."""
+    import importlib.util
+    if importlib.util.find_spec("google.colab") is not None:
+        return "colab"
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or Path("/kaggle/input").exists():
         return "kaggle"
-    if Path("/content").exists():
-        try:
-            import google.colab  # noqa: F401
-            return "colab"
-        except ImportError:
-            pass
     return "local"
 
 

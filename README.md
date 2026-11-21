@@ -322,7 +322,7 @@ Colab에서는 `notebooks/02_data_audit_split.ipynb`를 CPU 런타임으로 실�
 
 ## 11. 실험 결과
 
-### exp000: 공식 baseline 재현 (2026-11-21, Kaggle T4 1장, CPU 2개, `notebooks/01_baseline_repro.ipynb`)
+### exp000: 공식 baseline 재현 (2026-11-21, Colab T4 1장, CPU 2개, `notebooks/01_baseline_repro.ipynb`. 환경 감지 버그로 결과 JSON에는 `kaggle`로 찍힘)
 
 | ID | 모델 | 후보 구성 | 질의 | Score | Recall@1 | NDCG@5 | Hit@5 | Hit@20 | 순위 분포 (1 / 2-5 / 6-20 / >20) |
 |---|---|---|---|---|---|---|---|---|---|
