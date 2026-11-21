@@ -1,13 +1,17 @@
-"""HAIKUTHON 제출 모델: SigLIP 검색 → 조건 분해 재정렬 → (선택) BLIP ITM 재정렬.
+"""HAIKUTHON 제출 모델: SigLIP 검색 → 조건 분해 재정렬 → (선택) BLIP ITM 재정렬 → (선택) OWL-ViT 좌우·상하 점검.
 
 1. 후보 이미지를 한 번 읽어 SigLIP으로 인코딩한다 (DataLoader worker로 디코딩 병렬화).
    BLIP을 쓰면 같은 크기로 줄인 이미지를 GPU에 보관해 BLIP도 다시 읽지 않고 쓴다.
 2. 질의마다 원문으로 상위 K개 후보를 찾는다.
 3. 질의 문장 하나에서 규칙으로 객체별 조건과 대조 문구를 만들고, 후보 K개의 조건 점수를 원래 점수에 더한다.
 4. (models/blip이 있고 설정에서 켰을 때) 조건 재정렬 결과의 상위 k개를 BLIP ITM(교차 어텐션)으로 다시 채점해 더한다.
+5. (models/owl이 있고 설정에서 켰을 때) 질의에 단일 물체 사이의 좌우·상하 관계가 있으면, 최종 상위 2장에서
+   두 물체를 OWL-ViT로 검출해 상자 중심을 비교하고, 2위가 관계를 더 잘 지키면 두 장의 순서만 바꾼다.
+   검출은 (후보 이미지, 물체 이름)마다 독립이라 같은 이미지를 보는 질의끼리 계산만 공유한다.
 - 각 질의의 순위는 그 질의 문장과 후보 이미지만으로 계산한다. 다른 질의의 결과로 보정하지 않는다.
 - 같은 문구의 임베딩은 재사용한다 (값이 문구만으로 정해지므로 다른 질의에 의존하지 않음).
-- 재정렬·BLIP 사용 여부는 이미지 인코딩 직후 한 번만 정해 모든 질의에 똑같이 적용한다 (시간 안전장치).
+- 재정렬·BLIP 사용 여부는 이미지 인코딩 직후, OWL 사용 여부는 OWL 단계 직전에 한 번만 정해
+  모든 질의에 똑같이 적용한다 (시간 안전장치, 순위 보정이 아님).
 - models/ 폴더의 가중치와 설정만 읽는다. 네트워크를 쓰지 않는다.
 """
 import os
@@ -33,7 +37,7 @@ from transformers import AutoModel, AutoProcessor
 
 from haiku.rerank import PhraseBank, all_phrases, condition_margins, extract_conditions, rerank_scores
 
-IMG_BATCH, TXT_BATCH, MAX_TEXT_LEN, BLIP_BATCH, ITM_QBATCH = 64, 256, 64, 64, 128
+IMG_BATCH, TXT_BATCH, MAX_TEXT_LEN, BLIP_BATCH, ITM_QBATCH, OWL_BATCH = 64, 256, 64, 64, 128, 32
 WORKERS = int(os.environ.get("HAIKU_WORKERS", min(4, os.cpu_count() or 1)))
 
 
@@ -50,6 +54,11 @@ def load_model(model_dir, device):
         blip = BlipForImageTextRetrieval.from_pretrained(root / "blip", local_files_only=True, dtype=dtype).to(device).eval()
         model["blip"] = blip
         model["blip_proc"] = AutoProcessor.from_pretrained(root / "blip", local_files_only=True)
+    model["owl"] = None
+    if (cfg.get("owl") or {}).get("use") and (root / "owl").exists():
+        from transformers import OwlViTForObjectDetection, OwlViTProcessor
+        model["owl"] = OwlViTForObjectDetection.from_pretrained(root / "owl", local_files_only=True, dtype=dtype).to(device).eval()
+        model["owl_proc"] = OwlViTProcessor.from_pretrained(root / "owl", local_files_only=True)
     return model
 
 
@@ -170,6 +179,68 @@ def itm_scores(model, raw, img_idx, texts):
 
 
 @torch.inference_mode()
+def owl_detect(model, paths, need):
+    """need: {후보 번호: {물체 이름}} → {(후보 번호, 이름): (검출 점수, cx, cy)}.
+    이름마다 점수가 가장 높은 상자 하나 (haiku.owl.OwlChecker.detect와 같은 계산, 이미지는 한 번만 읽음)."""
+    owl, proc, dev = model["owl"], model["owl_proc"], model["device"]
+    names = sorted({n for v in need.values() for n in v})
+    row = {n: k for k, n in enumerate(names)}
+    tok = proc.tokenizer([f"a photo of a {n}" for n in names] + [" "], padding="max_length", truncation=True,
+                         return_tensors="pt").to(dev)
+    pad = len(names)
+    js = sorted(need)
+    dl = torch.utils.data.DataLoader(_Images([paths[j] for j in js], proc.image_processor), batch_size=OWL_BATCH,
+                                     num_workers=WORKERS, pin_memory=dev.type == "cuda")
+    out, s = {}, 0
+    for px in dl:
+        chunk = js[s:s + len(px)]
+        s += len(px)
+        lists = [sorted(need[j]) for j in chunk]
+        width = max(len(l) for l in lists)
+        ridx = torch.tensor([[row[n] for n in l] + [pad] * (width - len(l)) for l in lists], device=dev).view(-1)
+        o = owl(input_ids=tok["input_ids"][ridx], attention_mask=tok["attention_mask"][ridx],
+                pixel_values=px.to(dev, dtype=next(owl.parameters()).dtype, non_blocking=True))
+        probs, boxes = o.logits.float().sigmoid(), o.pred_boxes.float()
+        best = probs.argmax(dim=1)                                          # (B, 질의 수)
+        for b, (j, l) in enumerate(zip(chunk, lists)):
+            for q, n in enumerate(l):
+                p = int(best[b, q])
+                out[(j, n)] = (float(probs[b, p, q]), float(boxes[b, p, 0]), float(boxes[b, p, 1]))
+    return out
+
+
+def owl_rerank(model, queries, paths, orders, ocfg, t0, t_img_per):
+    """관계 질의의 최종 상위 2장만 OWL 규칙으로 다시 본다. 시간이 모자랄 것 같으면 모든 질의에서 건너뛴다."""
+    from haiku.owl import relation_score, spatial_relations
+    rels, need = {}, {}
+    for n, q in enumerate(queries):
+        r = spatial_relations(q["prompt"])
+        if r and len(orders[n]) >= 2:
+            names = tuple(sorted({x for _, a, b in r for x in (a, b)}))
+            rels[n] = (r, names)
+            for j in orders[n][:2]:
+                need.setdefault(j, set()).update(names)
+    info = {"owl_queries": len(rels), "owl_images": len(need), "owl_used": False}
+    elapsed = time.perf_counter() - t0
+    projected = len(need) * t_img_per * float(ocfg.get("cost_factor", 1.5))
+    info.update(owl_projected_sec=round(projected, 1), owl_start_sec=round(elapsed, 1))
+    if not rels or elapsed + projected > float(ocfg.get("budget_sec", 830)):
+        return info
+    det = owl_detect(model, paths, need)
+    thr, margin = float(ocfg.get("thr", 0.1)), float(ocfg.get("margin", 0.06))
+    swapped = 0
+    for n, (r, names) in rels.items():
+        a, b = orders[n][:2]
+        sa = relation_score({x: det[(a, x)] for x in names}, r, thr, margin)
+        sb = relation_score({x: det[(b, x)] for x in names}, r, thr, margin)
+        if sb > sa:
+            orders[n] = [b, a] + orders[n][2:]
+            swapped += 1
+    info.update(owl_used=True, owl_swapped=swapped, owl_sec=round(time.perf_counter() - t0 - elapsed, 1))
+    return info
+
+
+@torch.inference_mode()
 def predict(model, queries, candidates, top_k=5):
     t0 = time.perf_counter()
     cfg = model["cfg"]
@@ -183,6 +254,8 @@ def predict(model, queries, candidates, top_k=5):
         image_vecs, raw = encode_images_raw(model, paths)
     else:
         image_vecs, raw = encode_images(model, paths), None
+    t_img = time.perf_counter() - t0
+    timing = {"encode_sec": round(t_img, 1)}
     # 재정렬·BLIP 사용 여부는 여기서 한 번만 정한다 (질의 내용과 무관, 모든 질의에 동일)
     elapsed = time.perf_counter() - t0
     use_rerank = method != "A" and lam > 0 and elapsed < float(cfg.get("skip_rerank_after_sec", 700))
@@ -207,6 +280,7 @@ def predict(model, queries, candidates, top_k=5):
             o = new.argsort(descending=True)
             orders.append(torch.cat([idx[:K][o], idx[K:]]).tolist())
             heads.append(new[o].float())
+    timing["rerank_end_sec"] = round(time.perf_counter() - t0, 1)
     if use_itm and lam_itm > 0:
         k_itm = min(k_itm, K)
         sel = [n for n in range(len(queries)) if tau_itm is None or float(heads[n][0] - heads[n][1]) < tau_itm]
@@ -221,4 +295,11 @@ def predict(model, queries, candidates, top_k=5):
                 h = heads[n][:k_itm].to(sc) + lam_itm * sc[r]
                 head = [orders[n][j] for j in h.argsort(descending=True).tolist()]
                 orders[n] = head + orders[n][k_itm:]
+    timing["itm_used"] = bool(use_itm and lam_itm > 0)
+    timing["itm_end_sec"] = round(time.perf_counter() - t0, 1)
+    ocfg = cfg.get("owl") or {}
+    if model.get("owl") is not None and ocfg.get("use"):
+        timing.update(owl_rerank(model, queries, paths, orders, ocfg, t0, t_img / max(len(paths), 1)))
+    timing["total_sec"] = round(time.perf_counter() - t0, 1)
+    model["last_timing"] = timing
     return {q["prompt_id"]: [image_ids[j] for j in orders[n][:top_k]] for n, q in enumerate(queries)}
