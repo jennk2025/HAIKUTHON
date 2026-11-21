@@ -101,6 +101,30 @@ def _rel_value(rel, a, b, margin):
     return 0
 
 
+def relation_values(det, rels, thr, margin):
+    """관계마다 +1(맞음) / -1(어김) / 0(위치가 애매) / None(두 물체 중 하나를 확신 있게 못 찾음)."""
+    out = []
+    for rel, x, y in rels:
+        if x not in det or y not in det or min(det[x][0], det[y][0]) < thr:
+            out.append(None)
+        else:
+            out.append(_rel_value(rel, det[x], det[y], margin))
+    return out
+
+
+def should_swap(det_a, det_b, rels, thr, margin, strict=False):
+    """상위 2장(a=1위, b=2위)의 순서를 바꿀지.
+    기본: b의 관계 점수가 a보다 크면 바꿈 (v4).
+    strict: 두 이미지 모두에서 관계의 물체를 확신 있게 찾았고, a는 관계를 어기고(합 < 0) b는 지킬 때(합 > 0)만 바꿈.
+            한쪽에서 검출에 실패하면 '어김'으로 세지 않고 바꾸지 않는다."""
+    if not strict:
+        return relation_score(det_b, rels, thr, margin) > relation_score(det_a, rels, thr, margin)
+    va, vb = relation_values(det_a, rels, thr, margin), relation_values(det_b, rels, thr, margin)
+    if any(v is None for v in va + vb):
+        return False
+    return sum(va) < 0 < sum(vb)
+
+
 def relation_score(det, rels, thr, margin):
     """관계마다 +1(맞음) / -1(어김) / 0(판단 보류)의 합."""
     total = 0

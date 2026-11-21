@@ -375,6 +375,59 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
         res["val_relation_queries_ext"] = sum(p is not None for p in v_px)
         res["owl_ext_new_images"] = owl_chk.n_forward - n_ext0
 
+        # ---- v5 하락 원인 분리 + 엄격한 교환 규칙 (개발·검증 모두, v4 대비)
+        from haiku.owl import BASE_RELS, should_swap
+
+        def variant_orders(orders, prep, thr, mg, strict):
+            out = []
+            for (o, sc), pr in zip(orders, prep):
+                if pr:
+                    rels, names, paths = pr
+                    if should_swap(owl_chk.cache[(paths[0], names)], owl_chk.cache[(paths[1], names)], rels, thr, mg, strict):
+                        o, sc = [o[1], o[0]] + o[2:], [sc[1], sc[0]] + list(sc[2:])
+                out.append((o, sc))
+            return out
+
+        variants = {"v4 (좌우·상하, 0.1)": (False, 0.1, False), "기준값만 0.05": (False, 0.05, False),
+                    "확장만 (0.1)": (True, 0.1, False), "v5 (확장, 0.05)": (True, 0.05, False),
+                    "v4 + 엄격 규칙": (False, 0.1, True), "확장 + 엄격 규칙 (0.1)": (True, 0.1, True)}
+        preps = {False: (d_p, v_p), True: (d_px, v_px)}
+        ranks_of = lambda items, orders: [rank(o, it) for it, (o, _) in zip(items, orders)]
+        base_o = {"dev": variant_orders(d_o, d_p, 0.1, 0.06, False), "val": variant_orders(v_o, v_p, 0.1, 0.06, False)}
+        base_rk = {"dev": ranks_of(dev_items, base_o["dev"]), "val": ranks_of(val_items, base_o["val"])}
+        v3_rk = {"dev": ranks_of(dev_items, d_o), "val": v3}
+        table = {}
+        for name, (ext, thr_, strict) in variants.items():
+            row = {}
+            for split_name, items, orders, pp in (("dev", dev_items, d_o, preps[ext][0]), ("val", val_items, v_o, preps[ext][1])):
+                rk = ranks_of(items, variant_orders(orders, pp, thr_, 0.06, strict))
+                b3, b4 = v3_rk[split_name], base_rk[split_name]
+                fx3 = sum(a > 1 and r == 1 for a, r in zip(b3, rk))
+                br3 = sum(a == 1 and r > 1 for a, r in zip(b3, rk))
+                fx4 = sum(a > 1 and r == 1 for a, r in zip(b4, rk))
+                br4 = sum(a == 1 and r > 1 for a, r in zip(b4, rk))
+                row[split_name] = {"score": round(score(rk), 4), "fixed_vs_v3": fx3, "broken_vs_v3": br3,
+                                   "precision_vs_v3": round(fx3 / max(fx3 + br3, 1), 3), "fixed_vs_v4": fx4, "broken_vs_v4": br4}
+                if split_name == "val":
+                    per_q["ranks"][f"OWL[{name}]"] = rk
+            table[name] = row
+        res["owl_variants"] = table
+        # v4와 v5가 1위를 다르게 고른 검증 질의: 원인(확장 관계 / 기준값)과 누가 맞았는지
+        v5_rk = per_q["ranks"]["OWL[v5 (확장, 0.05)]"]
+        diff = []
+        v5_sub = variant_orders(v_o, v_px, 0.05, 0.06, False)          # 제출한 v5 설정 (확장, 0.05/0.06)
+        for n, (it, (o4, _), (o5, _)) in enumerate(zip(val_items, base_o["val"], v5_sub)):
+            if o4[0] == o5[0]:
+                continue
+            kinds = {r for r, _, _ in (v_px[n][0] if v_px[n] else [])}
+            extra = kinds - set(BASE_RELS)
+            cause = ("확장 관계(" + ",".join(sorted(extra)) + ")") if extra else "기준값 0.1→0.05"
+            who = "v4만 정답" if base_rk["val"][n] == 1 else ("v5만 정답" if v5_rk[n] == 1 else "둘 다 오답")
+            pr = v_px[n]
+            dets = [{x: tuple(round(v, 2) for v in owl_chk.cache[(p, pr[1])][x][:3]) for x in pr[1]} for p in pr[2]] if pr else []
+            diff.append({"q": it["q"], "cause": cause, "who": who, "rels": pr[0] if pr else [], "det_top1_top2": dets})
+        res["v4_vs_v5"] = diff
+
         def owl_orders(items, orders, prep, thr, mg):
             out, flags = [], []
             for (o, sc), pr in zip(orders, prep):

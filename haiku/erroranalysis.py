@@ -140,3 +140,29 @@ def diagnose(rows, per_query, variant="v3+OWL확장", k_blip=5, n_cases=30, seed
         L.append(f"  [{gold} 정답 / {wrong} 1위] {lab} | {why[:90]}")
         L.append(f"      {text[:160]}")
     return "\n".join(L)
+
+
+def owl_report(res, rows=None, n_examples=8):
+    """OWL 변형별 개발·검증 결과 표 + v4·v5가 다르게 고른 검증 질의의 원인."""
+    from collections import Counter
+    L = ["===== OWL 변형 비교 (v4 대비 고침/망침, 교환 정확도 = v3 대비 고침 / (고침+망침)) =====",
+         f"  {'변형':22s} | {'개발 점수':>8s} {'v4대비 +/-':>10s} | {'검증 점수':>8s} {'v4대비 +/-':>10s} {'교환 정확도':>10s}"]
+    for name, r in res.get("owl_variants", {}).items():
+        d, v = r["dev"], r["val"]
+        L.append(f"  {name:22s} | {d['score']:8.4f} {d['fixed_vs_v4']:>4d}/{d['broken_vs_v4']:<5d} | "
+                 f"{v['score']:8.4f} {v['fixed_vs_v4']:>4d}/{v['broken_vs_v4']:<5d} {v['precision_vs_v3']:>10.3f}")
+    diff = res.get("v4_vs_v5", [])
+    if diff:
+        n_val = len(res["per_query"]["q"])
+        L.append(f"\n===== v4와 v5가 1위를 다르게 고른 검증 질의: {len(diff)}개 ({len(diff) / n_val:.1%}, 테스트에서는 9.05%) =====")
+        c = Counter((d["cause"].split("(")[0], d["who"]) for d in diff)
+        for cause in sorted({k[0] for k in c}):
+            L.append(f"  {cause:12s} v4만 정답 {c[(cause, 'v4만 정답')]:3d} | v5만 정답 {c[(cause, 'v5만 정답')]:3d} | 둘 다 오답 {c[(cause, '둘 다 오답')]:3d}")
+        by_id = {r["id"]: r for r in rows} if rows else {}
+        L.append("  --- v4만 정답인 예 (관계, 1위·2위 이미지에서 찾은 물체: 확신도·중심 x·y) ---")
+        for d in [x for x in diff if x["who"] == "v4만 정답"][:n_examples]:
+            t = d["det_top1_top2"]
+            L.append(f"  [{d['q']}] {d['cause']} | 관계 {d['rels']} | 1위 {t[0] if t else '-'} | 2위 {t[1] if len(t) > 1 else '-'}")
+            if d["q"] in by_id:
+                L.append(f"      {by_id[d['q']]['prompt'][:150]}")
+    return "\n".join(L)

@@ -320,13 +320,13 @@ def owl_rerank(model, queries, paths, orders, scores, ocfg, ccfg, t0, t_img_per)
                 swapped += 1
         info.update(color_used=True, color_swapped=swapped, crops=len(crops))
     if rels:
+        from haiku.owl import should_swap
         thr, margin = float(ocfg.get("thr", 0.1)), float(ocfg.get("margin", 0.06))
+        strict = bool(ocfg.get("strict", False))
         swapped = 0
         for n, (r, names) in rels.items():
             a, b = orders[n][:2]
-            sa = relation_score({x: det[(a, x)] for x in names}, r, thr, margin)
-            sb = relation_score({x: det[(b, x)] for x in names}, r, thr, margin)
-            if sb > sa:
+            if should_swap({x: det[(a, x)] for x in names}, {x: det[(b, x)] for x in names}, r, thr, margin, strict):
                 orders[n] = [b, a] + orders[n][2:]
                 scores[n] = [scores[n][1], scores[n][0]] + scores[n][2:]
                 swapped += 1
