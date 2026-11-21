@@ -162,6 +162,10 @@ def rerank_scores(s_k, conds, M, method, lam, reliability, tau=None):
     """후보 K개의 새 점수. 원래 점수에 조건 점수를 더하기만 한다."""
     if method == "A" or not conds:
         return s_k
+    if method in ("MIN", "MIX"):
+        # 형제 이미지는 조건 하나만 어기는 경우가 많다. 평균은 그 하나를 희석하므로, 가장 크게 어긴 조건(최솟값)을 본다.
+        worst = M.min(0).values
+        return s_k + lam * (worst if method == "MIN" else 0.5 * (worst + M.mean(0)))
     if method == "D":
         if len(s_k) >= 2:
             top2 = s_k.topk(2).values

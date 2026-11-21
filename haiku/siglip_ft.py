@@ -223,29 +223,55 @@ def _score(ranks):
     return sum((r == 1) * 0.5 + (0.5 / math.log2(r + 1) if r <= 5 else 0.0) for r in ranks) / max(len(ranks), 1)
 
 
-def stage_eval(rows, splits, g_ids, img_fn, txt_fn, lam=3.2, Ks=(10, 50), lams=None, kinds=None):
-    """검색만 / 검색 + 조건 재정렬 단계의 점수 (BLIP 없이). splits: {이름: 질의 ID들}, g_ids: 후보 이미지 ID들 (질의 포함)."""
-    from haiku.combo import prepare
-    from haiku.rerank import PhraseBank, all_phrases, extract_conditions
+def stage_eval(rows, splits, g_ids, img_fn, txt_fn, lam=3.2, Ks=(10, 50), lams=None, kinds=None, methods=None):
+    """검색만 / 검색 + 조건 재정렬 단계의 점수 (BLIP 없이). splits: {이름: 질의 ID들}, g_ids: 후보 이미지 ID들 (질의 포함).
+    결과 키: (이름, K) | lams를 주면 (이름, K, 비중) | methods도 주면 (이름, K, 비중, 방식)."""
+    from haiku.rerank import PhraseBank, all_phrases, condition_margins, extract_conditions, rerank_scores
     by_id = {r["id"]: r for r in rows}
     g_ids = list(g_ids)
     pos = {i: k for k, i in enumerate(g_ids)}
     prompts = {i: by_id[i]["prompt"] for i in g_ids}
     img = img_fn([str(by_id[i]["image_path"]) for i in g_ids])
     txt = txt_fn([prompts[i] for i in g_ids])
+    combos = [(K, lm, m) for K in Ks for lm in (lams or [lam]) for m in (methods or ["B"])]
+    Kmax = min(max(Ks), len(g_ids))
     out = {}
     for name, q_ids in splits.items():
         conds = {i: [c for c in extract_conditions(prompts[i]) if kinds is None or c["kind"] in kinds] for i in q_ids}
         bank = PhraseBank(txt_fn)
         bank.add([p for i in q_ids for p in all_phrases(conds[i])])
-        for K, lm in [(K, lm) for K in Ks for lm in (lams or [lam])]:
-            items, _ = prepare(list(q_ids), g_ids, txt, img, pos, conds, bank, lm, K, None, None, prompts, 1)
-            sr = [it["base_rank"] for it in items]
-            cr = [it["idxB"].index(it["gold"]) + 1 if it["gold"] in it["idxB"] else max(it["base_rank"], K + 1) for it in items]
-            n = len(items)
-            out[(name, K, lm) if lams else (name, K)] = {"search": round(_score(sr), 4), "search_R@1": round(sum(r == 1 for r in sr) / n, 4),
-                              "search_top10": round(sum(r <= 10 for r in sr) / n, 4),
-                              "cond": round(_score(cr), 4), "cond_R@1": round(sum(r == 1 for r in cr) / n, 4),
-                              "cond_top5": round(sum(r <= 5 for r in cr) / n, 4),
-                              "cond_top10": round(sum(r <= 10 for r in cr) / n, 4)}
+        sr, cr = [], {c: [] for c in combos}
+        for q in q_ids:
+            sc = txt[pos[q]] @ img.T
+            gold = pos[q]
+            base = int((sc >= sc[gold]).sum())
+            sr.append(base)
+            top = sc.topk(Kmax)
+            M = condition_margins(conds[q], bank, img[top.indices])
+            for K, lm, m in combos:
+                new = rerank_scores(top.values[:K], conds[q], M[:, :K], m, lm, {})
+                order = top.indices[:K][new.argsort(descending=True)].tolist()
+                cr[(K, lm, m)].append(order.index(gold) + 1 if gold in order else max(base, K + 1))
+        n = len(q_ids)
+        for K, lm, m in combos:
+            r = cr[(K, lm, m)]
+            key = (name, K, lm, m) if methods else ((name, K, lm) if lams else (name, K))
+            out[key] = {"search": round(_score(sr), 4), "search_R@1": round(sum(x == 1 for x in sr) / n, 4),
+                        "search_top10": round(sum(x <= 10 for x in sr) / n, 4),
+                        "cond": round(_score(r), 4), "cond_R@1": round(sum(x == 1 for x in r) / n, 4),
+                        "cond_top5": round(sum(x <= 5 for x in r) / n, 4), "cond_top10": round(sum(x <= 10 for x in r) / n, 4)}
     return out
+
+
+def float_state(net):
+    """가중치 섞기용: 실수 가중치만 CPU로 복사."""
+    return {k: v.detach().float().cpu().clone() for k, v in net.state_dict().items() if v.is_floating_point()}
+
+
+def blend(net, sd_ft, sd_zs, alpha):
+    """net의 가중치를 alpha × 학습 가중치 + (1 − alpha) × 사전학습 가중치로 바꾼다 (같은 구조, 추론 비용 그대로).
+    사전학습 모델과 학습 모델의 가중치 공간 앙상블 — 학습 데이터와 다른 분포에서 더 안정적인 것으로 알려진 방법."""
+    cur = net.state_dict()
+    new = {k: (alpha * sd_ft[k] + (1 - alpha) * sd_zs[k]).to(cur[k].dtype) for k in sd_ft}
+    net.load_state_dict({**cur, **new})
+    return net
