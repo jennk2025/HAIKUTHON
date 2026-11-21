@@ -55,7 +55,7 @@ def cache_inputs(rows, processor, cache_path=None, workers=2):
     if cache_path and Path(cache_path).exists():
         c = torch.load(cache_path)
         if c["ids"] == ids:
-            print(f"전처리 캐시 사용: {cache_path}")
+            print(f"전처리 캐시 사용: {cache_path}", flush=True)
             return c["pixels"], c["input_ids"]
 
     class DS(torch.utils.data.Dataset):
@@ -70,7 +70,7 @@ def cache_inputs(rows, processor, cache_path=None, workers=2):
     pixels = torch.cat(list(dl))
     input_ids = processor(text=[r["prompt"] for r in rows], padding="max_length", truncation=True,
                           return_tensors="pt")["input_ids"]
-    print(f"전처리 {len(rows)}장 {time.time() - t0:.0f}초, pixels {tuple(pixels.shape)}")
+    print(f"전처리 {len(rows)}장 {time.time() - t0:.0f}초, pixels {tuple(pixels.shape)}", flush=True)
     if cache_path:
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
         torch.save({"ids": ids, "pixels": pixels, "input_ids": input_ids}, cache_path)
@@ -123,6 +123,8 @@ def train_arm(arm, args, seed, pixels, input_ids, index_of, train_ids, clear_tra
     net = build_model(args, device)
     params = [p for p in net.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=args.lr)
+    use_amp = device.type == "cuda"                      # A·B 모두 같은 반정밀도 설정 (속도용)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     log, t0, step = [], time.time(), 0
     for ep in range(args.epochs):
         rng = random.Random(seed * 1000 + ep)
@@ -136,16 +138,19 @@ def train_arm(arm, args, seed, pixels, input_ids, index_of, train_ids, clear_tra
         losses = []
         for b in batches:
             idx = [index_of[i] for i in b]
-            out = net(input_ids=input_ids[idx].to(device), pixel_values=pixels[idx].to(device).float(), return_loss=True)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                out = net(input_ids=input_ids[idx].to(device), pixel_values=pixels[idx].to(device).float(), return_loss=True)
             opt.zero_grad(set_to_none=True)
-            out.loss.backward()
-            opt.step()
+            scaler.scale(out.loss.float()).backward()
+            scaler.step(opt)
+            scaler.update()
             losses.append(out.loss.item())
             step += 1
         st["mean_loss"] = round(sum(losses) / len(losses), 4)
         log.append(st)
         print(f"  [{arm} seed{seed}] epoch {ep + 1}/{args.epochs} loss {st['mean_loss']:.4f} "
-              f"| 배치 안 명확한 형제 쌍 {st['clear_pairs_in_batches']} ({st['clear_pairs_per_batch']}/배치)")
+              f"| 배치 안 명확한 형제 쌍 {st['clear_pairs_in_batches']} ({st['clear_pairs_per_batch']}/배치) "
+              f"| {time.time() - t0:.0f}초", flush=True)
     return net, {"steps": step, "train_sec": round(time.time() - t0, 1), "epochs": log,
                  "trainable_params": sum(p.numel() for p in params)}
 
@@ -376,6 +381,31 @@ def render(res, args):
       "사례 설명의 '설명 비교'는 분석 표시용이며 검색 점수 계산에는 쓰지 않는다.")
     a("\n해석 주의: 그룹 분할 검증은 처음 보는 물체 조합에 대한 일반화도 함께 잰다. seed 간 표준편차보다 작은 차이는 우연일 수 있다.")
     return "\n".join(L) + "\n"
+
+
+def cond_check(rows, split, models, device="cuda", lam=3.2, K=10):
+    """학습한 SigLIP이 조건 재정렬과 합쳐도 나은지: 같은 검증 질의·후보에서 검색만 / 검색+조건 재정렬(λ 고정)을 비교.
+    models: {이름: 모델 ID 또는 저장 폴더}. λ는 v3와 같은 값으로 고정 (검증으로 고르지 않음)."""
+    from haiku.combo import _siglip
+    from haiku.vilt import _baseline
+    sc = lambda rk: round(sum(0.5 * ((r == 1) + (1 / math.log2(r + 1) if r <= 5 else 0)) for r in rk) / len(rk), 4)
+    out = {}
+    for name, path in models.items():
+        img_fn, txt_fn = _siglip(str(path), torch.device(device))
+        cache = {}
+        img_c = lambda p, f=img_fn, c=cache: c.setdefault(tuple(p), f(p))
+        res = {}
+        for tag, l in (("search", 0.0), ("search+cond", lam)):
+            _, _, val = _baseline(rows, split, img_c, txt_fn, l, K)
+            rk = [it["gold_rank"] for it in val]
+            res[tag] = {"score": sc(rk), "recall@1": round(sum(r == 1 for r in rk) / len(rk), 4)}
+        out[name] = res
+        print(f"  {name:12s} 검색만 {res['search']['score']:.4f} (R@1 {res['search']['recall@1']:.4f}) | "
+              f"검색+조건 재정렬 {res['search+cond']['score']:.4f} (R@1 {res['search+cond']['recall@1']:.4f})", flush=True)
+        del img_fn, txt_fn, cache
+        if device == "cuda" or str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
+    return out
 
 
 if __name__ == "__main__":

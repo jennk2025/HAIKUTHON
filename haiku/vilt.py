@@ -20,12 +20,14 @@ VILT_ID = "dandelin/vilt-b32-finetuned-coco"
 
 
 class ViltScorer:
-    def __init__(self, model_id=VILT_ID, device="cuda", local_files_only=False):
+    def __init__(self, model_id=VILT_ID, device="cuda", local_files_only=False, model=None):
+        """model: 이미 학습한 ViLT를 넣으면 그 모델로 채점한다 (없으면 공개 가중치)."""
         from transformers import ViltForImageAndTextRetrieval, ViltProcessor
         self.device = torch.device(device)
         self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
-        self.model = ViltForImageAndTextRetrieval.from_pretrained(model_id, dtype=self.dtype,
-                                                                  local_files_only=local_files_only).to(self.device).eval()
+        if model is None:
+            model = ViltForImageAndTextRetrieval.from_pretrained(model_id, local_files_only=local_files_only)
+        self.model = model.to(self.device, dtype=self.dtype).eval()
         self.proc = ViltProcessor.from_pretrained(model_id, local_files_only=local_files_only)
         self.cache, self.n, self.sec = {}, 0, 0.0
 
@@ -143,30 +145,113 @@ def probe_vilt(vilt, rows, train_ids, pairs_csv, contrast_csv, per_cat=100):
     return probe_2x2(orig, fn), probe_2x2(phr, fn)
 
 
-def run_vs_v3(rows, split, img_fn, txt_fn, vilt, lam_cond=3.2, K=10, k_list=(3, 5),
-              lam_grid=(0.01, 0.02, 0.05, 0.1, 0.2), w_grid=(0.0, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 1.0),
-              seed=0, dev_frac=0.15, epochs=3, device="cuda", limit=None):
-    """v3와 같은 구조(SigLIP → 조건 재정렬 → 학습한 BLIP)를 공정하게 재현하고, 그 위에 ViLT를 더하면 좋아지는지 본다.
-    - BLIP은 ITM 학습 그룹으로만 학습한다 (개발·검증 그룹은 보지 않음, [3/3]·v3 ①과 같은 분할).
-    - v3의 k·λ와 ViLT 비중 w는 개발 그룹에서 정하고, 검증 800질의에서 한 번만 보고한다 (w=0이면 ViLT를 안 쓰는 것과 같음).
-    - ViLT는 v3 순서의 상위 2장만 다시 본다."""
-    import argparse
+
+class _ViltImages(torch.utils.data.Dataset):
+    def __init__(self, paths, image_processor):
+        self.paths, self.ip = paths, image_processor
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, i):
+        with Image.open(self.paths[i]) as im:
+            im = im.convert("RGB")
+        return self.ip(images=im, return_tensors="pt")["pixel_values"][0].half()
+
+
+def train_vilt(rows, train_ids, device="cuda", epochs=3, lr=2e-5, queries_per_step=4, negatives=7, seed=0,
+               model_id=VILT_ID, workers=2):
+    """우리 데이터로 ViLT 학습 (BLIP 학습과 같은 방식): 질의마다 정답 1장 + 오답 7장(형제 이미지 먼저),
+    8장 중 정답을 고르도록 학습(CE). train_ids의 이미지·문장만 쓴다. 모델 전체를 학습한다."""
     import random
 
-    from haiku.combo import prepare
-    from haiku.itm import BLIP_ID
-    from haiku.itm_finetune import train_itm, wrap
-    from haiku.rerank import PhraseBank, all_phrases, extract_conditions
+    from transformers import ViltForImageAndTextRetrieval, ViltProcessor
+
+    from haiku.itm_finetune import negatives_for
     from haiku.siblings import build_groups, parse_prompt
     dev_t = torch.device(device)
     by_id = {r["id"]: r for r in rows}
+    group_of, members = build_groups(rows, {r["id"]: parse_prompt(r["prompt"]) for r in rows})
+    proc = ViltProcessor.from_pretrained(model_id)
+    torch.manual_seed(seed)
+    model = ViltForImageAndTextRetrieval.from_pretrained(model_id).to(dev_t)
+    t0 = time.perf_counter()
+    dl = torch.utils.data.DataLoader(_ViltImages([by_id[i]["image_path"] for i in train_ids], proc.image_processor),
+                                     batch_size=64, num_workers=workers)
+    px = torch.cat(list(dl))                                               # (N, 3, 384, 384) fp16, CPU
+    pos = {i: k for k, i in enumerate(train_ids)}
+    prep_sec = time.perf_counter() - t0
+    print(f"ViLT 이미지 전처리 {len(train_ids)}장 {prep_sec:.0f}초", flush=True)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    use_amp = dev_t.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    pool, pool_list = set(train_ids), sorted(train_ids)
+    log, t0 = [], time.perf_counter()
+    for ep in range(epochs):
+        rng = random.Random(seed * 1000 + ep)
+        order = list(train_ids)
+        rng.shuffle(order)
+        model.train()
+        losses = []
+        for s in range(0, len(order), queries_per_step):
+            qs = order[s:s + queries_per_step]
+            texts, idx = [], []
+            for q in qs:
+                negs = negatives_for(q, group_of, members, pool, pool_list, negatives, rng)
+                texts += [by_id[q]["prompt"]] * (1 + len(negs))
+                idx += [pos[q]] + [pos[x] for x in negs]
+            tok = proc.tokenizer(texts, padding="max_length", truncation=True, max_length=40, return_tensors="pt").to(dev_t)
+            pv = px[idx].to(dev_t, non_blocking=True).float()
+            mask = torch.ones(pv.shape[0], pv.shape[2], pv.shape[3], dtype=torch.long, device=dev_t)
+            with torch.autocast(device_type=dev_t.type, dtype=torch.float16, enabled=use_amp):
+                logit = model(**tok, pixel_values=pv, pixel_mask=mask).logits.float()
+            loss = torch.nn.functional.cross_entropy(logit.view(len(qs), -1),
+                                                     torch.zeros(len(qs), dtype=torch.long, device=dev_t))
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            losses.append(loss.item())
+        log.append({"epoch": ep + 1, "loss": round(sum(losses) / len(losses), 4)})
+        print(f"  ViLT epoch {ep + 1}/{epochs} loss {log[-1]['loss']:.4f}", flush=True)
+    model.eval()
+    del opt, px
+    return model, {"prep_sec": round(prep_sec, 1), "train_sec": round(time.perf_counter() - t0, 1), "epochs": log,
+                   "train_queries": len(train_ids)}
+
+
+def v3_groups(rows, split, seed=0, dev_frac=0.15):
+    """v3 조합 평가와 같은 분할: 학습 분할을 ITM 학습 그룹(ft)과 개발 그룹(dev)으로 나눈다. 검증(va)은 그대로."""
+    import random
+
+    from haiku.siblings import build_groups, parse_prompt
     group_of, _ = build_groups(rows, {r["id"]: parse_prompt(r["prompt"]) for r in rows})
     tr, va = list(split["train_ids"]), list(split["valid_ids"])
     groups = sorted({group_of[i] for i in tr})
     random.Random(seed).shuffle(groups)
     dev_groups = set(groups[:max(1, int(len(groups) * dev_frac))])
-    dev = [i for i in tr if group_of[i] in dev_groups]
-    ft = [i for i in tr if group_of[i] not in dev_groups]
+    return [i for i in tr if group_of[i] not in dev_groups], [i for i in tr if group_of[i] in dev_groups], va
+
+
+def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list=(3, 5),
+              lam_grid=(0.01, 0.02, 0.05, 0.1, 0.2), w_grid=(0.0, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0),
+              seed=0, dev_frac=0.15, epochs=3, device="cuda", limit=None,
+              owl_chk=None, thr_grid=(0.05, 0.1, 0.15, 0.2, 0.3), margin_grid=(0.03, 0.06, 0.1)):
+    """v3와 같은 구조(SigLIP → 조건 재정렬 → 학습한 BLIP)를 공정하게 재현하고, 그 위에 다른 점검을 더하면 좋아지는지 본다.
+    - BLIP은 ITM 학습 그룹으로만 학습한다 (개발·검증 그룹은 보지 않음, v3 ①과 같은 분할).
+    - vilt: 점수기 하나 또는 {이름: 점수기}. v3 순서의 상위 2장 점수에 w × 점수를 더해 두 장의 순서만 다시 정한다.
+    - owl_chk: 있으면 v3 상위 2장에 OWL 좌우·상하 규칙도 적용한다 (v4와 같은 위치).
+    - k·λ·w·OWL 기준값은 모두 개발 그룹에서 정하고, 검증 800질의에서 한 번만 보고한다."""
+    import argparse
+
+    from haiku.combo import prepare
+    from haiku.itm import BLIP_ID
+    from haiku.itm_finetune import train_itm, wrap
+    from haiku.rerank import PhraseBank, all_phrases, extract_conditions
+    scorers = vilt if isinstance(vilt, dict) else ({"ViLT": vilt} if vilt is not None else {})
+    dev_t = torch.device(device)
+    by_id = {r["id"]: r for r in rows}
+    ft, dev, va = v3_groups(rows, split, seed, dev_frac)
     if limit:
         ft, dev, va = ft[:limit[0]], dev[:limit[1]], va[:limit[2]]
     ns = argparse.Namespace(blip=BLIP_ID, seed=seed, lr=2e-5, epochs=epochs, queries_per_step=8, negatives=7)
@@ -184,6 +269,7 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt, lam_cond=3.2, K=10, k_list=(3, 
     k_max = max(k_list)
     dev_items, _ = prepare(dev, dev, txt, img, pos, conds, bank, lam_cond, K, itm, feats, prompts, k_max)
     val_items, _ = prepare(va, va, txt, img, pos, conds, bank, lam_cond, K, itm, feats, prompts, k_max)
+    del model, itm, feats
     score = lambda rk: sum(0.5 * ((r == 1) + (1 / math.log2(r + 1) if r <= 5 else 0)) for r in rk) / len(rk)
     rank = lambda order, it: order.index(it["gold"]) + 1 if it["gold"] in order else it["base_rank"]
 
@@ -194,11 +280,10 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt, lam_cond=3.2, K=10, k_list=(3, 
 
     grid = {(k, lam): score([rank(v3_order(it, k, lam)[0], it) for it in dev_items]) for k in k_list for lam in lam_grid}
     k, lam = max(grid, key=grid.get)
-
-    def vilt_scores(items, g_ids):
-        orders = [v3_order(it, k, lam) for it in items]
-        pairs = [(by_id[g_ids[o[j]]]["image_path"], prompts[it["q"]]) for it, (o, _) in zip(items, orders) for j in (0, 1)]
-        return orders, vilt.score(pairs)
+    d_o = [v3_order(it, k, lam) for it in dev_items]
+    v_o = [v3_order(it, k, lam) for it in val_items]
+    top2 = lambda items, g_ids, orders: [(by_id[g_ids[o[j]]]["image_path"], prompts[it["q"]])
+                                         for it, (o, _) in zip(items, orders) for j in (0, 1)]
 
     def with_w(items, orders, v, w):
         rk = []
@@ -208,18 +293,57 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt, lam_cond=3.2, K=10, k_list=(3, 
             rk.append(rank(order, it))
         return rk
 
-    d_o, d_v = vilt_scores(dev_items, dev)
-    v_o, v_v = vilt_scores(val_items, va)
-    wgrid = {w: score(with_w(dev_items, d_o, d_v, w)) for w in w_grid}
-    w = max(wgrid, key=wgrid.get)
     search = [it["base_rank"] for it in val_items]
-    v3 = with_w(val_items, v_o, v_v, 0.0)
-    v3v = with_w(val_items, v_o, v_v, w)
-    met = lambda rk, ref: {"score": round(score(rk), 4), "recall@1": round(sum(r == 1 for r in rk) / len(rk), 4),
-                           "fixed_vs_v3": sum(b > 1 and r == 1 for b, r in zip(ref, rk)),
-                           "broken_vs_v3": sum(b == 1 and r > 1 for b, r in zip(ref, rk))}
-    return {"sizes": {"itm_train": len(ft), "dev": len(dev), "val": len(va)}, "train": info,
-            "chosen_on_dev": {"k": k, "lam_itm": lam, "w_vilt": w, "dev_v3": round(grid[(k, lam)], 4),
-                              "dev_v3+vilt": round(wgrid[w], 4)},
-            "val_search_only": met(search, v3), "val_v3": met(v3, v3), "val_v3+ViLT": met(v3v, v3),
-            "val_v3_gold_exactly_2nd": sum(r == 2 for r in v3)}
+    v3 = with_w(val_items, v_o, [0.0] * (2 * len(val_items)), 0.0)
+    met = lambda rk: {"score": round(score(rk), 4), "recall@1": round(sum(r == 1 for r in rk) / len(rk), 4),
+                      "fixed_vs_v3": sum(b > 1 and r == 1 for b, r in zip(v3, rk)),
+                      "broken_vs_v3": sum(b == 1 and r > 1 for b, r in zip(v3, rk))}
+    chosen = {"k": k, "lam_itm": lam, "dev_v3": round(grid[(k, lam)], 4)}
+    res = {"sizes": {"itm_train": len(ft), "dev": len(dev), "val": len(va)}, "train": info,
+           "val_search_only": met(search), "val_v3": met(v3), "val_v3_gold_exactly_2nd": sum(r == 2 for r in v3)}
+    for name, sc in scorers.items():
+        t0, n0 = time.perf_counter(), getattr(sc, "n", 0)
+        d_v, v_v = sc.score(top2(dev_items, dev, d_o)), sc.score(top2(val_items, va, v_o))
+        wg = {w: score(with_w(dev_items, d_o, d_v, w)) for w in w_grid}
+        w = max(wg, key=wg.get)
+        res[f"val_v3+{name}"] = met(with_w(val_items, v_o, v_v, w))
+        chosen[f"w[{name}]"] = w
+        chosen[f"dev_v3+{name}"] = round(wg[w], 4)
+        res[f"pairs_per_sec[{name}]"] = round((getattr(sc, "n", 0) - n0) / max(time.perf_counter() - t0, 1e-6), 1)
+    if owl_chk is not None:
+        from haiku.owl import relation_score, spatial_relations
+
+        def owl_prep(items, g_ids, orders):
+            out, need = [], []
+            for it, (o, _) in zip(items, orders):
+                rels = spatial_relations(prompts[it["q"]])
+                if rels and len(o) >= 2:
+                    names = tuple(sorted({x for _, a, b in rels for x in (a, b)}))
+                    paths = [by_id[g_ids[j]]["image_path"] for j in o[:2]]
+                    need += [(p, names) for p in paths]
+                    out.append((rels, names, paths))
+                else:
+                    out.append(None)
+            owl_chk.detect(need)
+            return out
+
+        def owl_ranks(items, orders, prep, thr, mg):
+            rk = []
+            for it, (o, _), pr in zip(items, orders, prep):
+                if pr:
+                    rels, names, paths = pr
+                    sa, sb = (relation_score(owl_chk.cache[(p, names)], rels, thr, mg) for p in paths)
+                    if sb > sa:
+                        o = [o[1], o[0]] + o[2:]
+                rk.append(rank(o, it))
+            return rk
+
+        d_p, v_p = owl_prep(dev_items, dev, d_o), owl_prep(val_items, va, v_o)
+        og = {(t, m): score(owl_ranks(dev_items, d_o, d_p, t, m)) for t in thr_grid for m in margin_grid}
+        t, m = max(og, key=og.get)
+        res["val_v3+OWL"] = met(owl_ranks(val_items, v_o, v_p, t, m))
+        res["val_v3+OWL(v4값 0.1/0.06)"] = met(owl_ranks(val_items, v_o, v_p, 0.1, 0.06))
+        chosen.update({"owl_thr": t, "owl_margin": m, "dev_v3+OWL": round(og[(t, m)], 4)})
+        res["val_relation_queries"] = sum(p is not None for p in v_p)
+    res["chosen_on_dev"] = chosen
+    return res
