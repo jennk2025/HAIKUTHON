@@ -284,7 +284,7 @@ def owl_rerank(model, queries, paths, orders, scores, ocfg, ccfg, t0, t_img_per)
     per = t_img_per * float(ocfg.get("cost_factor", 1.5))
     budget = float(ocfg.get("budget_sec", 830))
     elapsed = time.perf_counter() - t0
-    info = {"owl_queries": len(rels), "color_queries": len(cols), "owl_images": len(all_need), "owl_used": False,
+    info = {"owl_queries": len(rels), "color_queries": len(cols), "owl_images": len(all_need), "owl_rel_images": len(need), "owl_used": False,
             "color_used": False, "owl_start_sec": round(elapsed, 1), "owl_projected_sec": round(len(all_need) * per, 1)}
     if "skip_after_sec" in ocfg:
         # 경과 시간만으로 정한다 (다른 질의의 예측에서 나온 값은 쓰지 않음). 기준은 서버 규모 시간 측정으로 정한 상수.
