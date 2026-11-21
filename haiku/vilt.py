@@ -308,12 +308,19 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
     chosen = {"k": k, "lam_itm": lam, "dev_v3": round(grid[(k, lam)], 4)}
     res = {"sizes": {"itm_train": len(ft), "dev": len(dev), "val": len(va)}, "train": info,
            "val_search_only": met(search), "val_v3": met(v3), "val_v3_gold_exactly_2nd": sum(r == 2 for r in v3)}
+    per_q = {"q": [it["q"] for it in val_items], "ranks": {"search": search, "v3": v3}}
+    _met = met
+
+    def met(rk, name=None):                         # 보고용 지표 + 질의별 순위 보관
+        if name:
+            per_q["ranks"][name] = list(rk)
+        return _met(rk)
     for name, sc in scorers.items():
         t0, n0 = time.perf_counter(), getattr(sc, "n", 0)
         d_v, v_v = sc.score(top2(dev_items, dev, d_o)), sc.score(top2(val_items, va, v_o))
         wg = {w: score(with_w(dev_items, d_o, d_v, w)) for w in w_grid}
         w = max(wg, key=wg.get)
-        res[f"val_v3+{name}"] = met(with_w(val_items, v_o, v_v, w))
+        res[f"val_v3+{name}"] = met(with_w(val_items, v_o, v_v, w), f"v3+{name}")
         chosen[f"w[{name}]"] = w
         chosen[f"dev_v3+{name}"] = round(wg[w], 4)
         res[f"pairs_per_sec[{name}]"] = round((getattr(sc, "n", 0) - n0) / max(time.perf_counter() - t0, 1e-6), 1)
@@ -349,8 +356,8 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
         d_p, v_p = owl_prep(dev_items, dev, d_o), owl_prep(val_items, va, v_o)
         og = {(t, m): score(owl_ranks(dev_items, d_o, d_p, t, m)) for t in thr_grid for m in margin_grid}
         t, m = max(og, key=og.get)
-        res["val_v3+OWL"] = met(owl_ranks(val_items, v_o, v_p, t, m))
-        res["val_v3+OWL(v4값 0.1/0.06)"] = met(owl_ranks(val_items, v_o, v_p, 0.1, 0.06))
+        res["val_v3+OWL"] = met(owl_ranks(val_items, v_o, v_p, t, m), "v3+OWL")
+        res["val_v3+OWL(v4값 0.1/0.06)"] = met(owl_ranks(val_items, v_o, v_p, 0.1, 0.06), "v3+OWL(v4값 0.1/0.06)")
         chosen.update({"owl_thr": t, "owl_margin": m, "dev_v3+OWL": round(og[(t, m)], 4)})
         res["val_relation_queries"] = sum(p is not None for p in v_p)
         res["owl_relation_images"] = owl_chk.n_forward - n_owl0
@@ -372,7 +379,7 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
         (d_c, _, _), (v_c, v_used, v_its) = color_vals(dev_items, dev, d_o), color_vals(val_items, va, v_o)
         cg = {mu: score(with_w(dev_items, d_o, d_c, mu)) for mu in mu_grid}
         mu = max(cg, key=cg.get)
-        res["val_v3+COLOR"] = met(with_w(val_items, v_o, v_c, mu))
+        res["val_v3+COLOR"] = met(with_w(val_items, v_o, v_c, mu), "v3+COLOR")
         chosen.update({"mu_color": mu, "dev_v3+COLOR": round(cg[mu], 4)})
         rel_imgs = {p for pr in (v_p if owl_chk is not None else []) if pr for p in pr[2]}
         col_imgs = {path for (path, prompt) in v_its if color_chk_conds(prompt)}
@@ -392,6 +399,7 @@ def run_vs_v3(rows, split, img_fn, txt_fn, vilt=None, lam_cond=3.2, K=10, k_list
                     out.append((order, sc))
                 return out
             v_oc = swapped(val_items, v_o, v_c, mu)
-            res["val_v3+COLOR+OWL"] = met(owl_ranks(val_items, v_oc, owl_prep(val_items, va, v_oc), t, m))
+            res["val_v3+COLOR+OWL"] = met(owl_ranks(val_items, v_oc, owl_prep(val_items, va, v_oc), t, m), "v3+COLOR+OWL")
     res["chosen_on_dev"] = chosen
+    res["per_query"] = per_q
     return res
