@@ -132,3 +132,12 @@ def run_vilt_experiment(rows, split, img_fn, txt_fn, vilt, owl_chk=None, owl_par
             "vilt_pairs_per_sec": round(vilt.n / max(vilt.sec, 1e-6), 1),
             "examples_fixed": [val[n]["q"] for n in range(len(val)) if base[n] == 2 and rk_c[n] == 1][:10],
             "examples_broken": [val[n]["q"] for n in range(len(val)) if base[n] == 1 and rk_c[n] == 2][:10]}
+
+
+def probe_vilt(vilt, rows, train_ids, pairs_csv, contrast_csv, per_cat=100):
+    """2×2 점검 (학습 분할 안): 두 설명(또는 대조 문구)이 각자 자기 이미지를 더 높게 보는지. itm.probe_2x2와 같은 기준."""
+    from haiku.itm import load_probe_pairs, probe_2x2
+    by_id = {r["id"]: r for r in rows}
+    orig, phr = load_probe_pairs(pairs_csv, contrast_csv, train_ids, per_cat)
+    fn = lambda texts, ids: torch.tensor(vilt.score([(by_id[i]["image_path"], t) for t, i in zip(texts, ids)]))
+    return probe_2x2(orig, fn), probe_2x2(phr, fn)
